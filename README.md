@@ -102,28 +102,45 @@ npm install mcp-auth-kit @modelcontextprotocol/sdk
 the version the test suite actually runs against, and the package genuinely
 cannot work below it:
 
-- **The `issuer` stamp on tokens and client information.** The issuer-binding
-  check (refusing to send a `refresh_token` or client credentials to an
-  authorization server other than the one that issued them) reads
-  `tokens.issuer` / `clientInformation.issuer`, and mcp-auth-kit re-stamps
-  that field on every refresh. On an SDK whose schemas don't carry `issuer`,
-  that whole protection silently degrades to a no-op.
-- **Recent optional `OAuthClientProvider` members.** The conditional-delegation
-  design forwards `discoveryState`, `saveDiscoveryState`,
-  `prepareTokenRequest` and `clientMetadataUrl` when the wrapped provider has
-  them. These don't exist on older interface versions.
-- **The subpath export `@modelcontextprotocol/sdk/server/auth/errors.js`.**
-  Retry classification imports the SDK's own `OAuthError` subclasses from it,
-  and it only resolves through the `"./*"` wildcard in the SDK's export map.
+**The binding reason is the issuer-binding mechanism.** `issuersMatch`,
+`discardIfIssuerMismatch` and the `issuer` field on `OAuthTokensSchema` /
+`OAuthClientInformationSchema` **do not exist in any SDK release up to and
+including 1.30.1** — verified by inspecting the published tarballs for 1.15.0,
+1.20.0, 1.25.0, 1.28.0, 1.29.0, 1.30.0 and 1.30.1. They landed in 1.31.0.
+
+Three of this package's core security behaviours are built directly on that
+field and would become **silent no-ops** below 1.31.0:
+
+- the issuer-binding check that refuses to send a `refresh_token` or client
+  credentials to an authorization server other than the one that issued them
+  (it reads `tokens.issuer` / `clientInformation.issuer`);
+- the re-stamping of `issuer` on every refresh, without which the check above
+  disables itself the first time mcp-auth-kit refreshes;
+- the trailing-slash-tolerant issuer comparison, which mirrors the SDK's own
+  `issuersMatch`.
+
+"Silently degrades to a no-op" is the worst possible failure mode for a
+security check, which is why the floor is a hard `^1.31.0` rather than a
+best-effort range.
+
+For completeness, two things that are **not** the reason, despite an earlier
+version of this README claiming otherwise:
+
+- The subpath export `@modelcontextprotocol/sdk/server/auth/errors.js` resolves
+  through the `"./*"` wildcard in the SDK's export map — but that wildcard has
+  been present since at least 1.15.0, so it constrains nothing here.
+- Of the recent optional `OAuthClientProvider` members the conditional
+  delegation forwards, `prepareTokenRequest` arrived by 1.25.0 and
+  `discoveryState` by 1.28.0 — both below the floor, so neither sets it either.
 
 An earlier release declared `>=1.0.0`, which was a compatibility claim nobody
-had verified and that was almost certainly false. `tests/package-manifest.test.ts`
-now pins this down: it fails if the declared peer floor drops below the
-verified one, if the dev dependency drifts below the peer floor, or if the
-features the floor exists for stop being present in the installed SDK. If you
-re-verify against a different SDK version, update the range, the
-`VERIFIED_FLOOR` constant in that test, and the version noted in
-`src/issuerMatch.ts` together.
+had verified and which the evidence above shows was false by roughly thirty
+minor versions. `tests/package-manifest.test.ts` pins this down: it fails if
+the declared peer floor drops below the verified one, if the dev dependency
+drifts below the peer floor, or if the features the floor exists for stop being
+present in the installed SDK. If you re-verify against a different SDK version,
+update the range, the `VERIFIED_FLOOR` constant in that test, and the version
+noted in `src/issuerMatch.ts` together.
 
 ## Usage
 

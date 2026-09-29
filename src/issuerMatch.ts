@@ -15,6 +15,17 @@
  * THIS IS A FORK. RE-VERIFY ON EVERY `@modelcontextprotocol/sdk` BUMP.
  * ---------------------------------------------------------------------------
  * Verified equivalent against SDK **1.31.0** (`dist/esm/client/auth.js`).
+ *
+ * Note on how young the upstream original is: `issuersMatch`,
+ * `discardIfIssuerMismatch` and the `issuer` field on `OAuthTokensSchema` do
+ * not exist in ANY SDK release up to and including 1.30.1 — verified by
+ * inspecting the published tarballs for 1.15.0, 1.20.0, 1.25.0, 1.28.0,
+ * 1.29.0, 1.30.0 and 1.30.1. The whole issuer-binding mechanism landed in
+ * 1.31.0, so at the time of writing this fork tracks code that has existed
+ * upstream for exactly ONE release. Brand-new code of this kind is far more
+ * likely to be reshaped than a long-stable helper, which makes the drift test
+ * below load-bearing rather than defensive-just-in-case: it is the only thing
+ * that will tell you the copy has gone stale.
  * `tests/issuer-match.test.ts` enforces this automatically: it extracts the
  * real `issuersMatch` source from the installed SDK at test time, executes
  * it, and differentially fuzzes it against this implementation. If upstream

@@ -38,6 +38,14 @@ export interface InMemoryProviderOptions {
   canSaveClientInformation?: boolean;
   /** Set to give this provider an invalidateCredentials() implementation. */
   canInvalidateCredentials?: boolean;
+  /**
+   * When true, `invalidateCredentials()` actually deletes the credentials, as
+   * the SDK's interface intends ("provides a way for the client to invalidate
+   * (e.g. delete) the specified credentials"), instead of only recording the
+   * call. Opt-in so existing tests that rely on the stored tokens surviving an
+   * invalidation keep working unchanged.
+   */
+  invalidateClearsCredentials?: boolean;
 }
 
 /** A minimal, fully in-memory OAuthClientProvider, the kind real MCP clients write. */
@@ -70,6 +78,10 @@ export class InMemoryProvider implements OAuthClientProvider {
     if (opts.canInvalidateCredentials) {
       this.invalidateCredentials = async (scope) => {
         this.invalidateCredentialsCalls.push(scope);
+        if (opts.invalidateClearsCredentials) {
+          if (scope === 'all' || scope === 'tokens') this._tokens = undefined;
+          if (scope === 'all' || scope === 'client') this._clientInformation = undefined;
+        }
       };
     }
   }

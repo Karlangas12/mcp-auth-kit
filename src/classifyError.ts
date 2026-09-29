@@ -1,8 +1,11 @@
 import {
+  InvalidClientError,
+  InvalidGrantError,
   OAuthError,
   ServerError,
   TemporarilyUnavailableError,
   TooManyRequestsError,
+  UnauthorizedClientError,
 } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 
 /**
@@ -62,4 +65,41 @@ export function isAbortError(error: unknown): boolean {
 export function isRetryableRegistrationError(error: unknown): boolean {
   if (isAbortError(error)) return false;
   return isRetryableOAuthError(error);
+}
+
+/**
+ * Whether the SDK's own `auth()` orchestrator recognises this error type and
+ * recovers from it by itself.
+ *
+ * `auth()` wraps `authInternal` in a catch that matches exactly three classes
+ * (verified against the installed SDK, `client/auth.js`):
+ *
+ * ```js
+ * if (error instanceof InvalidClientError || error instanceof UnauthorizedClientError) {
+ *     await provider.invalidateCredentials?.('all');
+ *     return await authInternal(provider, options);
+ * } else if (error instanceof InvalidGrantError) {
+ *     await provider.invalidateCredentials?.('tokens');
+ *     return await authInternal(provider, options);
+ * }
+ * throw error;
+ * ```
+ *
+ * The retry then finds no usable credentials and falls through to
+ * `startAuthorization()` + `redirectToAuthorization()`, i.e. the user is sent
+ * to re-authorize instead of being handed a hard failure.
+ *
+ * Because `auth()` calls `provider.tokens()` (this package's wrapper) BEFORE
+ * reaching its own refresh logic, a refresh failure raised from inside
+ * `tokens()` is what `auth()` sees. Wrapping these three classes in a
+ * `McpAuthKitError` — which extends `Error`, not `OAuthError` — makes the
+ * match fail and silently disables that recovery. So for these three, and
+ * only these three, mcp-auth-kit rethrows the original error unwrapped.
+ */
+export function isSdkRecoverableOAuthError(error: unknown): boolean {
+  return (
+    error instanceof InvalidGrantError ||
+    error instanceof InvalidClientError ||
+    error instanceof UnauthorizedClientError
+  );
 }

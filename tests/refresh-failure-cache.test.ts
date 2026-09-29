@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { InvalidGrantError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { wrapOAuthClientProvider } from '../src/index.js';
 import { InMemoryProvider, jsonResponse, testClientInformation, testClientMetadata } from './helpers.js';
 
@@ -36,16 +37,19 @@ describe('Bajo-7: a definitively-failed refresh is not retried within the failur
     });
     await seedExpiredTokens(wrapped);
 
-    await expect(wrapped.tokens()).rejects.toMatchObject({ phase: 'token_refresh' });
+    // FIX 2 (round 4): invalid_grant is one of the three classes the SDK's
+    // auth() recovers from, so it is rethrown UNWRAPPED — see
+    // tests/sdk-recovery.test.ts for why that matters.
+    await expect(wrapped.tokens()).rejects.toBeInstanceOf(InvalidGrantError);
     expect(fetchFn).toHaveBeenCalledTimes(1);
 
     // Second and third attempts must not reach the network at all.
-    await expect(wrapped.tokens()).rejects.toMatchObject({ phase: 'token_refresh' });
-    await expect(wrapped.tokens()).rejects.toMatchObject({ phase: 'token_refresh' });
+    await expect(wrapped.tokens()).rejects.toBeInstanceOf(InvalidGrantError);
+    await expect(wrapped.tokens()).rejects.toBeInstanceOf(InvalidGrantError);
     expect(fetchFn).toHaveBeenCalledTimes(1);
   });
 
-  it('the short-circuit error explains itself and preserves the original cause', async () => {
+  it('serves a cached recoverable failure with its ORIGINAL OAuth type, not a wrapper', async () => {
     const inner = new InMemoryProvider(testClientMetadata);
     inner.presetClientInformation(testClientInformation);
 
@@ -56,7 +60,37 @@ describe('Bajo-7: a definitively-failed refresh is not retried within the failur
     });
     await seedExpiredTokens(wrapped);
 
-    await expect(wrapped.tokens()).rejects.toThrow();
+    await expect(wrapped.tokens()).rejects.toBeInstanceOf(InvalidGrantError);
+
+    // The cached error must keep the type too: if the negative cache downgraded
+    // it to a McpAuthKitError, it would silently re-break the SDK's recovery
+    // that FIX 2 restores — the exact interaction round 4 flagged.
+    let caught: unknown;
+    try {
+      await wrapped.tokens();
+    } catch (error) {
+      caught = error;
+    }
+    expect(fetchFn).toHaveBeenCalledTimes(1); // served from cache, no network
+    expect(caught).toBeInstanceOf(InvalidGrantError);
+    expect((caught as Error).message).toMatch(/invalid_grant/);
+  });
+
+  it('wraps a NON-recoverable definitive failure in McpAuthKitError, and caches it as such', async () => {
+    const inner = new InMemoryProvider(testClientMetadata);
+    inner.presetClientInformation(testClientInformation);
+
+    // invalid_scope is definitive (not retryable) but is NOT one of the three
+    // classes auth() recovers from, so the typed wrapper is still right here.
+    const fetchFn = vi.fn(async () => oauthErrorResponse('invalid_scope'));
+    const wrapped = wrapOAuthClientProvider(inner, {
+      authorizationServerUrl: 'https://auth.example.com',
+      fetchFn: fetchFn as unknown as typeof fetch,
+    });
+    await seedExpiredTokens(wrapped);
+
+    await expect(wrapped.tokens()).rejects.toMatchObject({ phase: 'token_refresh' });
+    expect(fetchFn).toHaveBeenCalledTimes(1);
 
     let caught: unknown;
     try {
@@ -65,9 +99,10 @@ describe('Bajo-7: a definitively-failed refresh is not retried within the failur
       caught = error;
     }
     const err = caught as Error & { cause?: unknown; phase?: string };
+    expect(fetchFn).toHaveBeenCalledTimes(1); // served from cache
     expect(err.phase).toBe('token_refresh');
     expect(err.message).toMatch(/failure-cache window/);
-    expect((err.cause as Error)?.message).toMatch(/invalid_grant/);
+    expect((err.cause as Error)?.message).toMatch(/invalid_scope/);
   });
 
   it('does NOT cache a transient failure (server_error stays retryable)', async () => {

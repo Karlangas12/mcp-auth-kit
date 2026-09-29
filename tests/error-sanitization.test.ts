@@ -129,7 +129,7 @@ describe('sanitizedCause preserves the real error type (M7)', () => {
     expect(serverError).not.toBeInstanceOf(InvalidGrantError);
   });
 
-  it('end to end: a refresh failing with invalid_grant surfaces as cause instanceof InvalidGrantError', async () => {
+  it('end to end: a refresh failing with invalid_grant surfaces AS InvalidGrantError (FIX 2, round 4)', async () => {
     const inner = new InMemoryProvider(testClientMetadata);
     inner.presetClientInformation(testClientInformation);
     const fetchFn = vi.fn(async () =>
@@ -157,7 +157,46 @@ describe('sanitizedCause preserves the real error type (M7)', () => {
       caught = error;
     }
 
-    expect((caught as Error & { cause?: unknown }).cause).toBeInstanceOf(InvalidGrantError);
+    // Round 4 / FIX 2: invalid_grant is now rethrown unwrapped so the SDK's
+    // auth() recovery still fires, so it IS the InvalidGrantError rather than
+    // being carried as the `.cause` of a McpAuthKitError. Its message is still
+    // sanitized in place.
+    expect(caught).toBeInstanceOf(InvalidGrantError);
+    expect((caught as Error).message).not.toMatch(/[\n\r]/);
+  });
+
+  it('a NON-recoverable OAuth failure still arrives wrapped, with the type preserved in .cause', async () => {
+    const inner = new InMemoryProvider(testClientMetadata);
+    inner.presetClientInformation(testClientInformation);
+    const fetchFn = vi.fn(async () =>
+      new Response(JSON.stringify({ error: 'invalid_scope', error_description: 'bad\nscope' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    const wrapped = wrapOAuthClientProvider(inner, {
+      authorizationServerUrl: 'https://auth.example.com',
+      fetchFn: fetchFn as unknown as typeof fetch,
+    });
+    await wrapped.saveTokens({
+      access_token: 'expired',
+      token_type: 'Bearer',
+      refresh_token: 'refresh-1',
+      expires_in: -10,
+    });
+
+    let caught: unknown;
+    try {
+      await wrapped.tokens();
+    } catch (error) {
+      caught = error;
+    }
+    const err = caught as Error & { cause?: unknown; phase?: string };
+    expect(err.phase).toBe('token_refresh');
+    expect(err.message).not.toMatch(/[\n\r]/);
+    expect((err.cause as Error).message).not.toMatch(/[\n\r]/);
+    expect((err.cause as Error).name).toBe('InvalidScopeError');
   });
 
   it('a non-Error value becomes a sanitized plain Error', () => {
