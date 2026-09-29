@@ -27,3 +27,39 @@ export function isRetryableOAuthError(error: unknown): boolean {
   // or a non-OAuth-shaped 5xx — treat as transient.
   return true;
 }
+
+/**
+ * Whether a request was aborted — either by mcp-auth-kit's own `timeoutMs`
+ * or by an `AbortSignal` the caller supplied. Both surface as an error named
+ * `AbortError` (a `DOMException` under a real `fetch`); `TimeoutError` is the
+ * name `AbortSignal.timeout()` uses, included for completeness.
+ */
+export function isAbortError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'name' in error &&
+    ((error as { name?: unknown }).name === 'AbortError' ||
+      (error as { name?: unknown }).name === 'TimeoutError')
+  );
+}
+
+/**
+ * Retry policy for RFC 7591 dynamic client registration specifically.
+ *
+ * A6: registration is a NON-IDEMPOTENT POST. When mcp-auth-kit's own timeout
+ * aborts it, the authorization server may already have created the client —
+ * we simply never saw the response. Retrying then produces a second, distinct
+ * client registration (each with its own `client_secret`), which is precisely
+ * the duplicate-registration failure the retry classification exists to
+ * avoid. An abort is therefore treated as definitive here: mcp-auth-kit
+ * surfaces the timeout rather than risk registering twice.
+ *
+ * This is deliberately NOT applied to the refresh path, which has no retry
+ * loop at all and whose (different, documented) timeout trade-off was settled
+ * separately — see the `timeoutMs` option docs.
+ */
+export function isRetryableRegistrationError(error: unknown): boolean {
+  if (isAbortError(error)) return false;
+  return isRetryableOAuthError(error);
+}

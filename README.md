@@ -96,6 +96,35 @@ npm install mcp-auth-kit @modelcontextprotocol/sdk
 
 (Not yet published — see [Status](#status) below.)
 
+### Supported `@modelcontextprotocol/sdk` versions
+
+**`^1.31.0`.** That floor is deliberate and narrower than it may look — it is
+the version the test suite actually runs against, and the package genuinely
+cannot work below it:
+
+- **The `issuer` stamp on tokens and client information.** The issuer-binding
+  check (refusing to send a `refresh_token` or client credentials to an
+  authorization server other than the one that issued them) reads
+  `tokens.issuer` / `clientInformation.issuer`, and mcp-auth-kit re-stamps
+  that field on every refresh. On an SDK whose schemas don't carry `issuer`,
+  that whole protection silently degrades to a no-op.
+- **Recent optional `OAuthClientProvider` members.** The conditional-delegation
+  design forwards `discoveryState`, `saveDiscoveryState`,
+  `prepareTokenRequest` and `clientMetadataUrl` when the wrapped provider has
+  them. These don't exist on older interface versions.
+- **The subpath export `@modelcontextprotocol/sdk/server/auth/errors.js`.**
+  Retry classification imports the SDK's own `OAuthError` subclasses from it,
+  and it only resolves through the `"./*"` wildcard in the SDK's export map.
+
+An earlier release declared `>=1.0.0`, which was a compatibility claim nobody
+had verified and that was almost certainly false. `tests/package-manifest.test.ts`
+now pins this down: it fails if the declared peer floor drops below the
+verified one, if the dev dependency drifts below the peer floor, or if the
+features the floor exists for stop being present in the installed SDK. If you
+re-verify against a different SDK version, update the range, the
+`VERIFIED_FLOOR` constant in that test, and the version noted in
+`src/issuerMatch.ts` together.
+
 ## Usage
 
 ```ts
@@ -148,6 +177,24 @@ means:
 So: mcp-auth-kit only ever *narrows* behavior your provider already has
 (pre-normalizing a resource string, retrying a registration call), never
 *widens* it by pretending to support something it doesn't.
+
+### A related, deliberate consequence: issuer mismatch causes re-registration
+
+When mcp-auth-kit performs dynamic client registration itself (the
+`registration` option), it stamps the result with the **configured**
+`authorizationServerUrl`, exactly as the SDK's own `auth()` stamps what it
+registers. If that configured value genuinely differs from the authorization
+server `auth()` discovers via RFC 9728 — beyond the trailing-slash, scheme-case
+and default-port tolerance the issuer comparison already applies — then
+`auth()`'s own `discardIfIssuerMismatch` will discard mcp-auth-kit's
+registration and register again itself.
+
+That is intended, not a bug to suppress. Reusing a client registration bound to
+one authorization server against a different one is the failure actually worth
+preventing; a duplicate registration is the visible, recoverable symptom of a
+configuration mismatch that a caller needs to fix. If you see duplicate client
+registrations, the thing to correct is the `authorizationServerUrl` you passed,
+not this behavior.
 
 ## Resource normalization: what this does and doesn't cover
 
@@ -206,6 +253,27 @@ implementations look like. If your provider implements
 - `McpAuthKitError` — the typed error class, with `.phase` and `.remediation`.
 - `ExpiryStore` (type) — the interface for the optional expiry-persistence
   adapter described below.
+- `isRetryableRegistrationError(error)` — the registration-specific retry
+  policy: like `isRetryableOAuthError`, but treats an aborted (timed-out or
+  caller-cancelled) request as definitive, because RFC 7591 registration is a
+  non-idempotent POST and retrying one the server may already have applied
+  creates a duplicate client.
+
+### Two options worth knowing about
+
+- **`onWarning`** — mcp-auth-kit emits exactly one kind of warning (an
+  `expiryStore` returning a non-finite value, which it then treats as
+  "unknown" rather than silently trusting). It goes to `console.warn` by
+  default; pass `onWarning` to route it into your own logger, or a no-op to
+  silence it. Nothing else in the package writes to the console.
+- **`refreshFailureCacheMs`** (default 30000) — after a refresh fails with a
+  *definitive* error (`invalid_grant`: the refresh token is revoked or
+  expired), further refresh attempts are short-circuited for this long
+  instead of firing another doomed request on every `tokens()` call.
+  Transient failures — network errors, `server_error`, `429`, and
+  mcp-auth-kit's own timeout — are never cached, since those may well
+  succeed on the next attempt. The window is cleared by a successful
+  `saveTokens()` or by `invalidateCredentials()`.
 
 ## Expiry persistence
 
@@ -298,9 +366,15 @@ liability:
   about it once per process rather than either crashing or silently
   disabling proactive refresh forever.
 - **A value that's technically finite but implausible** — implying the token
-  is valid for centuries, say — is clamped through the same
-  `minExpiresInSeconds`/`maxExpiresInSeconds` bounds a server-supplied
-  `expires_in` goes through.
+  is valid for centuries, say — is capped at `maxExpiresInSeconds` from now.
+  Only the *upper* bound applies on this path. `minExpiresInSeconds` is
+  deliberately **not** applied to a stored timestamp: that bound exists to
+  reject a malformed `expires_in` *duration* (`0` or negative) coming
+  straight off the wire, whereas a stored timestamp in the past is not
+  malformed at all — it is the store correctly reporting that the token has
+  already expired, and `expiresAt = 0` is specifically the revocation
+  sentinel below. Raising those forward would manufacture validity that
+  doesn't exist and silently defeat the sentinel.
 - **A failing `set()`** (during `saveTokens()`) never fails the save itself —
   the wrapped provider's own `saveTokens()` already succeeded by that point;
   a supplementary expiry cache failing to write degrades to in-memory-only

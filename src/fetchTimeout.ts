@@ -14,24 +14,46 @@ export function withTimeout(fetchFn: FetchLike | undefined, timeoutMs: number): 
   const base: FetchLike = fetchFn ?? ((url, init) => fetch(url, init));
   return async (url, init) => {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
     const callerSignal = init?.signal ?? undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     let onCallerAbort: (() => void) | undefined;
+    let cleanedUp = false;
+
+    // Bajo-5: cleanup must be reachable even if `base` never settles. A
+    // non-conforming fetch that ignores the AbortSignal would otherwise leave
+    // our listener attached to the caller's (possibly long-lived, shared)
+    // signal forever. Running this from the timeout path too bounds the
+    // listener's lifetime to `timeoutMs` regardless of how `base` behaves.
+    const cleanup = (): void => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      if (timer !== undefined) clearTimeout(timer);
+      if (callerSignal && onCallerAbort) {
+        callerSignal.removeEventListener('abort', onCallerAbort);
+      }
+    };
+
+    timer = setTimeout(() => {
+      controller.abort();
+      cleanup();
+    }, timeoutMs);
+
     if (callerSignal) {
       if (callerSignal.aborted) {
         controller.abort();
       } else {
-        onCallerAbort = () => controller.abort();
+        onCallerAbort = () => {
+          controller.abort();
+          cleanup();
+        };
         callerSignal.addEventListener('abort', onCallerAbort);
       }
     }
+
     try {
       return await base(url, { ...init, signal: controller.signal });
     } finally {
-      clearTimeout(timer);
-      if (callerSignal && onCallerAbort) {
-        callerSignal.removeEventListener('abort', onCallerAbort);
-      }
+      cleanup();
     }
   };
 }
