@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
+import { InvalidGrantError, ServerError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { wrapOAuthClientProvider } from '../src/index.js';
-import { sanitizeForMessage } from '../src/sanitize.js';
+import { sanitizeForMessage, sanitizedCause } from '../src/sanitize.js';
 import { InMemoryProvider, errorResponse, testClientInformation, testClientMetadata } from './helpers.js';
 
 // B11: a malicious or misconfigured authorization server controls
@@ -99,5 +100,69 @@ describe('server-controlled text never reaches McpAuthKitError.message or .cause
   it('sanity: errorResponse() still round-trips through the SDK as an OAuth error', async () => {
     const res = errorResponse(500);
     expect(res.status).toBe(500);
+  });
+});
+
+// M7: sanitizedCause() must sanitize server-controlled text WITHOUT
+// discarding the concrete error type — callers need `err.cause instanceof
+// InvalidGrantError` to distinguish "revoked, re-authorize" from "transient,
+// retry later".
+describe('sanitizedCause preserves the real error type (M7)', () => {
+  it('a sanitized OAuthError subclass instance is still that exact subclass', () => {
+    const original = new InvalidGrantError('the refresh_token\nis dead\r\nlong live the token');
+    const result = sanitizedCause(original);
+
+    expect(result).toBeInstanceOf(InvalidGrantError);
+    expect(result).toBe(original); // same object, mutated in place — not replaced
+    expect((result as Error).message).not.toMatch(/[\n\r]/);
+    expect((result as Error).message).toContain('the refresh_token');
+    expect((result as Error).message).toContain('is dead');
+  });
+
+  it('distinguishes InvalidGrantError from ServerError after sanitization', () => {
+    const grantError = sanitizedCause(new InvalidGrantError('revoked\nby admin'));
+    const serverError = sanitizedCause(new ServerError('temporarily\ndown'));
+
+    expect(grantError).toBeInstanceOf(InvalidGrantError);
+    expect(grantError).not.toBeInstanceOf(ServerError);
+    expect(serverError).toBeInstanceOf(ServerError);
+    expect(serverError).not.toBeInstanceOf(InvalidGrantError);
+  });
+
+  it('end to end: a refresh failing with invalid_grant surfaces as cause instanceof InvalidGrantError', async () => {
+    const inner = new InMemoryProvider(testClientMetadata);
+    inner.presetClientInformation(testClientInformation);
+    const fetchFn = vi.fn(async () =>
+      new Response(
+        JSON.stringify({ error: 'invalid_grant', error_description: 'refresh token revoked' }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    const wrapped = wrapOAuthClientProvider(inner, {
+      authorizationServerUrl: 'https://auth.example.com',
+      fetchFn: fetchFn as unknown as typeof fetch,
+    });
+    await wrapped.saveTokens({
+      access_token: 'expired',
+      token_type: 'Bearer',
+      refresh_token: 'refresh-1',
+      expires_in: -10,
+    });
+
+    let caught: unknown;
+    try {
+      await wrapped.tokens();
+    } catch (error) {
+      caught = error;
+    }
+
+    expect((caught as Error & { cause?: unknown }).cause).toBeInstanceOf(InvalidGrantError);
+  });
+
+  it('a non-Error value becomes a sanitized plain Error', () => {
+    const result = sanitizedCause('raw string\nwith a newline');
+    expect(result).toBeInstanceOf(Error);
+    expect((result as Error).message).not.toMatch(/\n/);
   });
 });

@@ -36,6 +36,8 @@ export interface InMemoryProviderOptions {
   state?: () => string | Promise<string>;
   /** When false, this provider cannot persist client information at all (no saveClientInformation). */
   canSaveClientInformation?: boolean;
+  /** Set to give this provider an invalidateCredentials() implementation. */
+  canInvalidateCredentials?: boolean;
 }
 
 /** A minimal, fully in-memory OAuthClientProvider, the kind real MCP clients write. */
@@ -46,6 +48,7 @@ export class InMemoryProvider implements OAuthClientProvider {
   private readonly _opts: InMemoryProviderOptions;
   redirectToAuthorizationCalls: URL[] = [];
   validateResourceURLCalls: Array<{ serverUrl: string | URL; resource?: string }> = [];
+  invalidateCredentialsCalls: string[] = [];
 
   constructor(
     private readonly metadata: OAuthClientMetadata,
@@ -63,6 +66,11 @@ export class InMemoryProvider implements OAuthClientProvider {
     }
     if (opts.canSaveClientInformation === false) {
       this.saveClientInformation = undefined as unknown as InMemoryProvider['saveClientInformation'];
+    }
+    if (opts.canInvalidateCredentials) {
+      this.invalidateCredentials = async (scope) => {
+        this.invalidateCredentialsCalls.push(scope);
+      };
     }
   }
 
@@ -106,6 +114,7 @@ export class InMemoryProvider implements OAuthClientProvider {
   // TypeScript knows the (optional) interface members can exist on instances.
   validateResourceURL?: OAuthClientProvider['validateResourceURL'];
   state?: OAuthClientProvider['state'];
+  invalidateCredentials?: OAuthClientProvider['invalidateCredentials'];
 
   /** Test helper, not part of the interface. */
   presetClientInformation(info: OAuthClientInformationFull) {

@@ -56,33 +56,55 @@ describe('resource indicator trailing-slash normalization (claude-code#52871)', 
     ]);
   });
 
-  it('the normalized resource (no trailing slash) is what actually gets sent on refresh', async () => {
+  // B3: the wrapper itself must normalize `options.resource` — this is the
+  // ONE place mcp-auth-kit fully controls the value end to end (its own
+  // refresh call). The test below deliberately passes the RAW, unnormalized
+  // value (as `new URL(...).href` naturally produces for a pathless origin,
+  // per anthropics/claude-code#52871) straight through `options.resource`,
+  // without normalizing it in the test itself — proving the wrapper does
+  // the normalization, not the test.
+  it('normalizes a raw, un-normalized options.resource before sending it on refresh (pathless origin)', async () => {
     const inner = new InMemoryProvider(testClientMetadata);
     inner.presetClientInformation(testClientInformation);
-    await inner.saveTokens({
-      access_token: 'expired',
-      token_type: 'Bearer',
-      refresh_token: 'refresh-1',
-      expires_in: -10, // already expired
-    });
 
     const fetchFn = vi.fn(async (_url: string | URL, init?: RequestInit) => {
       const body = new URLSearchParams(String(init?.body));
-      expect(body.get('resource')).toBe('https://mcp.example.com/mcp');
-      return jsonResponse({
-        access_token: 'fresh',
-        token_type: 'Bearer',
-        expires_in: 3600,
-      });
+      expect(body.get('resource')).toBe('https://mcp.example.com');
+      return jsonResponse({ access_token: 'fresh', token_type: 'Bearer', expires_in: 3600 });
     });
 
     const wrapped = wrapOAuthClientProvider(inner, {
       authorizationServerUrl: 'https://auth.example.com',
       fetchFn: fetchFn as unknown as typeof fetch,
-      resource: normalizeResourceIndicator(new URL('https://mcp.example.com/mcp').href),
+      // Raw, un-normalized: exactly what `new URL('https://mcp.example.com').href` produces.
+      resource: 'https://mcp.example.com/',
     });
-    // saveTokens above went through `inner` directly so the wrapper doesn't
-    // yet know the expiry; save again through the wrapper so it does.
+    await wrapped.saveTokens({
+      access_token: 'expired',
+      token_type: 'Bearer',
+      refresh_token: 'refresh-1',
+      expires_in: -10,
+    });
+
+    await wrapped.tokens();
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('also normalizes when options.resource is passed as a URL object', async () => {
+    const inner = new InMemoryProvider(testClientMetadata);
+    inner.presetClientInformation(testClientInformation);
+
+    const fetchFn = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const body = new URLSearchParams(String(init?.body));
+      expect(body.get('resource')).toBe('https://mcp.example.com/mcp');
+      return jsonResponse({ access_token: 'fresh', token_type: 'Bearer', expires_in: 3600 });
+    });
+
+    const wrapped = wrapOAuthClientProvider(inner, {
+      authorizationServerUrl: 'https://auth.example.com',
+      fetchFn: fetchFn as unknown as typeof fetch,
+      resource: new URL('https://mcp.example.com/mcp/'),
+    });
     await wrapped.saveTokens({
       access_token: 'expired',
       token_type: 'Bearer',

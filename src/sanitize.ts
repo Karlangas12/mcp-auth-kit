@@ -13,15 +13,25 @@ export function sanitizeForMessage(value: string, maxLength = 300): string {
 }
 
 /**
- * Wraps an arbitrary caught value as an `Error` whose message has been
- * sanitized, safe to use as `McpAuthKitError.cause` without leaking
- * unsanitized server-controlled text through the cause chain.
+ * Sanitizes a caught value for use as `McpAuthKitError.cause`, WITHOUT
+ * discarding its concrete type. `error.message` (which, for the SDK's own
+ * `OAuthError` subclasses, is exactly the authorization server's
+ * `error_description`) is the one field that can carry untrusted,
+ * attacker-controlled text — so only that field is rewritten in place. The
+ * original error object (and its prototype chain) is returned unchanged
+ * otherwise, so callers can still do `err.cause instanceof InvalidGrantError`
+ * to distinguish "refresh token revoked, re-authorize" from "transient
+ * failure, retry later".
  */
-export function sanitizedCause(error: unknown): Error {
+export function sanitizedCause(error: unknown): unknown {
   if (error instanceof Error) {
-    const sanitized = new Error(sanitizeForMessage(error.message));
-    sanitized.name = error.name;
-    return sanitized;
+    try {
+      error.message = sanitizeForMessage(error.message);
+    } catch {
+      // Some exotic error subclass might have a read-only `message` — leave
+      // it as-is rather than losing the typed error entirely.
+    }
+    return error;
   }
   return new Error(sanitizeForMessage(String(error)));
 }

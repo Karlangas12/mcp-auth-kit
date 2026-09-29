@@ -36,13 +36,29 @@ interface and returns another one — same interface, same call sites — with:
 2. **Real refresh-token usage, bound to the right issuer.** Once the access
    token is due to expire, mcp-auth-kit calls the `refresh_token` grant
    automatically — it doesn't just store the refresh token and never touch
-   it. Before sending it, mcp-auth-kit checks the stored client/token
-   `issuer` (when stamped) against the configured `authorizationServerUrl`
-   and refuses to refresh on a mismatch, so a refresh token and client
+   it, and it re-stamps the `issuer` on every token/client-information it
+   saves (the token endpoint response never includes one — it's a
+   client-side-only field). Before sending it, mcp-auth-kit checks the
+   stored client/token `issuer` (when stamped) against the configured
+   `authorizationServerUrl` — using the same trailing-slash-tolerant
+   comparison the SDK itself uses for this, not raw string equality — and
+   refuses to refresh on a mismatch, so a refresh token and client
    credentials are never sent to the wrong authorization server. Concurrent
    `tokens()` calls during expiry share a single in-flight refresh request,
-   and every HTTP call mcp-auth-kit makes is bounded by a timeout so a hung
-   authorization server can't block the client forever.
+   and every HTTP call mcp-auth-kit makes is bounded by a configurable
+   timeout (`timeoutMs`, default 30s) so a hung authorization server can't
+   block the client forever.
+   >
+   > **Known limitation:** the refresh call is a non-idempotent POST. If the
+   > authorization server actually completes the refresh (and rotates the
+   > refresh token) but the response doesn't arrive before `timeoutMs`
+   > elapses, mcp-auth-kit aborts having never seen the new refresh token.
+   > The next refresh attempt then fails (the old refresh token is already
+   > invalidated server-side) and forces a full re-login. This is not
+   > retried — retrying a possibly-already-applied mutation would reopen the
+   > double-registration risk the registration-retry classification below
+   > exists to avoid. If your authorization server is known to be slow,
+   > raise `timeoutMs`.
 3. **Retried dynamic client registration — only when it's worth retrying.**
    If the wrapped provider has no stored client information and you opt in
    via the `registration` option, mcp-auth-kit performs RFC 7591 dynamic
@@ -53,22 +69,24 @@ interface and returns another one — same interface, same call sites — with:
    that will never succeed. Registration is refused outright, at wrap time,
    if the wrapped provider has no `saveClientInformation` to persist the
    result into.
-4. **Normalized `resource` indicators — without inventing validation.**
-   `resource` values are stripped of a spurious trailing slash before being
-   sent. mcp-auth-kit never defines `validateResourceURL` on your behalf: if
-   the wrapped provider already implements it, mcp-auth-kit only
-   pre-normalizes the trailing slash before delegating to it; if it doesn't,
-   mcp-auth-kit leaves the member undefined so the SDK's own
-   `checkResourceAllowed` audience check still runs. (See
-   [Design note](#design-note-conditional-delegation) below — this one
-   matters.)
+4. **Normalized `resource` indicator — for the one call mcp-auth-kit actually
+   controls.** `options.resource` is stripped of a spurious trailing slash
+   before mcp-auth-kit's own refresh call sends it. This does **not** cover
+   every path a trailing slash could enter through — see [Resource
+   normalization: what this does and doesn't cover](#resource-normalization-what-this-does-and-doesnt-cover)
+   below, it matters and the honest scope is narrower than "fixes the
+   trailing-slash bug everywhere."
 5. **Typed, actionable errors — never silent failure.** Every failure mode
    above throws `McpAuthKitError` with a `phase` (`token_refresh`,
    `client_registration`, `resource_validation`, `authorization`) and a
-   concrete remediation string, instead of a bare "unauthorized." Any
-   server-controlled text (e.g. `error_description`) is stripped of control
-   characters before it's interpolated into a message or `cause`, so a
-   malicious authorization server can't forge log lines through it.
+   concrete remediation string, instead of a bare "unauthorized." The
+   underlying error is preserved as `.cause` with its real type intact — you
+   can still do `err.cause instanceof InvalidGrantError` to tell "refresh
+   token revoked, re-authorize" apart from "transient failure, retry later" —
+   only its `.message` (the one field that can carry the authorization
+   server's own untrusted `error_description`) is stripped of control
+   characters, so a malicious authorization server can't forge log lines
+   through it.
 
 ## Install
 
@@ -131,6 +149,46 @@ So: mcp-auth-kit only ever *narrows* behavior your provider already has
 (pre-normalizing a resource string, retrying a registration call), never
 *widens* it by pretending to support something it doesn't.
 
+## Resource normalization: what this does and doesn't cover
+
+`normalizeResourceIndicator()` strips a trailing slash from a `resource`
+string. mcp-auth-kit applies it in exactly **one** place: `options.resource`,
+before mcp-auth-kit's own `refreshAuthorization()` call sends it. That's the
+only `resource` value mcp-auth-kit fully owns end to end.
+
+It does **not** cover the `resource` the SDK's own `auth()` orchestrator
+sends during discovery/authorization-code exchange, and here's why that's
+correct, not an oversight — verified against `client/auth.js`:
+
+- When the wrapped provider has **no** `validateResourceURL` of its own (the
+  common case), `auth()` already sends the protected-resource metadata's
+  `resource` string verbatim — `resourceMetadata.resource`, never
+  `.href`-round-tripped (`auth.js:266`, the SDK's own fix for
+  [modelcontextprotocol/typescript-sdk#1968](https://github.com/modelcontextprotocol/typescript-sdk)).
+  There is no trailing slash for mcp-auth-kit to strip here; the SDK never
+  introduces one in this path.
+- When the wrapped provider **does** implement `validateResourceURL`,
+  mcp-auth-kit pre-normalizes the string it passes into that call (see the
+  design note above) — but that provider returns a `URL` object, and
+  `auth()` then calls `.href` on it (`resourceIndicatorToString`,
+  `auth.js:773-775`), which re-adds the trailing slash for a pathless
+  origin regardless of what string went in. mcp-auth-kit cannot fix this
+  without either reimplementing `auth()`'s resource-selection logic itself
+  (a much larger scope than a token-provider wrapper) or overriding
+  `validateResourceURL` on the wrapped provider's behalf — which is exactly
+  what an earlier version of this package did, and exactly what reopened the
+  confused-deputy vector described in the design note above (a provider's
+  own `validateResourceURL` is the thing doing real audience validation;
+  papering over its return value to fix formatting would mean either
+  bypassing that validation or silently rewriting its result). This case is
+  the wrapped provider's own responsibility, not mcp-auth-kit's.
+
+So the trailing-slash fix (bug **c** in the table) is fully covered for
+mcp-auth-kit's own refresh calls, and for the SDK's default (no
+`validateResourceURL`) path — which is what most `OAuthClientProvider`
+implementations look like. If your provider implements
+`validateResourceURL` itself, normalizing what it returns is on it.
+
 ## Also exported
 
 - `normalizeResourceIndicator(resource: string): string` — the trailing-slash
@@ -141,7 +199,8 @@ So: mcp-auth-kit only ever *narrows* behavior your provider already has
   (network failure, `server_error`, `temporarily_unavailable`, `429`) or
   definitive (`invalid_client_metadata`, `unauthorized_client`, etc.).
 - `withTimeout(fetchFn, timeoutMs)` — wraps a `fetch`-like function so every
-  call aborts after `timeoutMs`.
+  call aborts after `timeoutMs`. Combines with (never overrides) an
+  `AbortSignal` the caller already passed in `init.signal`.
 - `sanitizeForMessage(value)` — strips control characters/newlines from
   untrusted text before it's used in a log line or error message.
 - `McpAuthKitError` — the typed error class, with `.phase` and `.remediation`.
@@ -213,17 +272,51 @@ const expiryStore: ExpiryStore = {
 
 const authProvider = wrapOAuthClientProvider(myProvider, {
   authorizationServerUrl: 'https://auth.example.com',
+  resource: 'https://mcp.example.com/mcp',
   expiryStore,
-  // resourceKey defaults to String(authorizationServerUrl); override if one
-  // store instance needs to track more than one MCP server/session.
+  // resourceKey defaults to `${authorizationServerUrl}::${resource}` (or
+  // just authorizationServerUrl if no resource is configured) — override if
+  // you need a different scheme. The default exists so that two different
+  // protected resources sitting behind the same authorization server don't
+  // share (and clobber) one expiry entry.
 });
 ```
 
 With this configured, mcp-auth-kit persists `expiresAt` on every
 `saveTokens()` and consults the store before deciding whether a freshly
 loaded token needs a proactive refresh — so it can now decide correctly, with
-real knowledge, on a cold start. A failing `get()` degrades gracefully to the
-no-adapter default rather than blocking `tokens()`.
+real knowledge, on a cold start.
+
+A few things mcp-auth-kit does to keep this store from becoming its own
+liability:
+
+- **A failing `get()` degrades gracefully** to the no-adapter default rather
+  than blocking `tokens()`.
+- **A non-finite value from `get()`** (`NaN`, `Infinity` — whether from a
+  corrupted store or a hostile one) is never trusted. It's treated exactly
+  like "unknown" (same as no store at all), and mcp-auth-kit `console.warn`s
+  about it once per process rather than either crashing or silently
+  disabling proactive refresh forever.
+- **A value that's technically finite but implausible** — implying the token
+  is valid for centuries, say — is clamped through the same
+  `minExpiresInSeconds`/`maxExpiresInSeconds` bounds a server-supplied
+  `expires_in` goes through.
+- **A failing `set()`** (during `saveTokens()`) never fails the save itself —
+  the wrapped provider's own `saveTokens()` already succeeded by that point;
+  a supplementary expiry cache failing to write degrades to in-memory-only
+  tracking for the rest of the process instead of turning a successful save
+  into a thrown error.
+- **`invalidateCredentials('all' | 'tokens')`** removes the persisted entry
+  via `expiryStore.delete()` if the store implements it, or overwrites it
+  with a sentinel (`expiresAt = 0`, i.e. "already expired") if it doesn't —
+  either way, a revoked credential doesn't leave a stale, still-valid-looking
+  expiry behind.
+
+None of the above changes *where* credentials get sent — the store only ever
+influences *when* mcp-auth-kit decides to refresh, never *who* it refreshes
+against (that's what the issuer check above is for). A store an attacker can
+write to can, at worst, make refresh happen too early or too late; it cannot
+redirect a refresh_token or client_secret anywhere.
 
 ### Which to use
 

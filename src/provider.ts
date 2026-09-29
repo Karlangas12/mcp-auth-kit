@@ -14,6 +14,7 @@ import { isRetryableOAuthError } from './classifyError.js';
 import { McpAuthKitError } from './errors.js';
 import type { ExpiryStore } from './expiryStore.js';
 import { withTimeout } from './fetchTimeout.js';
+import { issuersMatch } from './issuerMatch.js';
 import { normalizeResourceIndicator } from './resource.js';
 import { sanitizeForMessage, sanitizedCause } from './sanitize.js';
 import { withExponentialBackoff, type BackoffOptions } from './retry.js';
@@ -39,20 +40,30 @@ export interface McpAuthKitOptions {
    * Lower bound, in seconds, clamped onto a server-supplied `expires_in`
    * before it's trusted. Guards against a server sending `0` or a negative
    * value, which would otherwise trigger a refresh on every single call.
-   * Default: 30.
+   * Also applied to a raw timestamp read back from `expiryStore` (as a TTL
+   * relative to "now"), for the same reason. Default: 30.
    */
   minExpiresInSeconds?: number;
   /**
-   * Upper bound, in seconds, clamped onto a server-supplied `expires_in`
-   * before it's trusted. Guards against an unreasonably large value leaving
-   * a token that's actually been revoked looking valid indefinitely.
-   * Default: 30 days.
+   * Upper bound, in seconds, clamped onto a server-supplied `expires_in` (or
+   * an `expiryStore`-supplied timestamp) before it's trusted. Guards against
+   * an unreasonably large value leaving a token that's actually been revoked
+   * looking valid indefinitely. Default: 30 days.
    */
   maxExpiresInSeconds?: number;
   /**
    * Timeout, in ms, applied to every HTTP call mcp-auth-kit makes on the
    * client's behalf (registration, token refresh). A hung authorization
    * server must not be able to block the whole MCP client. Default: 30000.
+   *
+   * Known limitation: the token refresh request is a non-idempotent POST.
+   * If the authorization server actually completes (and rotates) the
+   * refresh token before this timeout fires, but the response doesn't reach
+   * us in time, we abort having never seen the new refresh token — the next
+   * refresh attempt then fails with an invalid_grant-shaped error and forces
+   * a full re-login. This is not retried (retrying a possibly-already-applied
+   * mutation would reopen the double-registration risk M10 exists to avoid);
+   * raise `timeoutMs` if your authorization server is known to be slow.
    */
   timeoutMs?: number;
   /**
@@ -64,7 +75,12 @@ export interface McpAuthKitOptions {
    * a client it cannot persist.
    */
   registration?: BackoffOptions;
-  /** RFC 8707 resource indicator to send with token requests, pre-normalization. */
+  /**
+   * RFC 8707 resource indicator to send with token requests. Normalized
+   * (trailing slash stripped) before mcp-auth-kit's own refresh call uses
+   * it. This only covers mcp-auth-kit's own refresh path — see README
+   * "Resource normalization: what this does and doesn't cover".
+   */
   resource?: string | URL;
   /**
    * Optional store for the access-token expiry clock, so it survives a
@@ -79,10 +95,15 @@ export interface McpAuthKitOptions {
   expiryStore?: ExpiryStore;
   /**
    * Key under which `expiryStore` persists this session's expiry. Defaults
-   * to `String(authorizationServerUrl)`, consistent with `auth()`'s own
-   * issuer-based session scoping.
+   * to `authorizationServerUrl` combined with `resource` (when set), so two
+   * different protected resources behind the same authorization server
+   * don't share (and clobber) one expiry entry.
    */
   resourceKey?: string;
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
 }
 
 /**
@@ -115,10 +136,20 @@ export function wrapOAuthClientProvider(
   const maxExpiresInSeconds = options.maxExpiresInSeconds ?? 30 * 24 * 60 * 60;
   const timeoutMs = options.timeoutMs ?? 30 * 1000;
   const registrationOptions = options.registration;
-  const resource = options.resource;
+  // B3: normalized once, up front — this is the only place mcp-auth-kit
+  // itself controls the `resource` value it sends (its own refresh call).
+  const resource =
+    options.resource !== undefined
+      ? normalizeResourceIndicator(
+          typeof options.resource === 'string' ? options.resource : options.resource.href,
+        )
+      : undefined;
   const fetchFn = withTimeout(options.fetchFn, timeoutMs);
   const expiryStore = options.expiryStore;
-  const resourceKey = options.resourceKey ?? configuredIssuer;
+  // M3: combine issuer + resource so two protected resources behind the
+  // same authorization server don't share one expiry entry.
+  const resourceKey =
+    options.resourceKey ?? (resource !== undefined ? `${configuredIssuer}::${resource}` : configuredIssuer);
 
   if (registrationOptions && !provider.saveClientInformation) {
     throw new McpAuthKitError(
@@ -137,8 +168,12 @@ export function wrapOAuthClientProvider(
    * that legitimately has no value would be re-queried on every tokens() call.
    */
   let expiryStoreChecked = false;
+  /** In-flight expiryStore.get(), so concurrent cold tokens() calls share one read. */
+  let expiryLoad: Promise<number | undefined> | undefined;
   /** In-flight refresh, so concurrent tokens() calls share one refresh request. */
-  let refreshing: Promise<OAuthTokens | undefined> | undefined;
+  let refreshing: Promise<OAuthTokens> | undefined;
+  /** Whether we've already warned about an invalid expiryStore value this process. */
+  let warnedInvalidExpiryValue = false;
 
   function clampExpiresInSeconds(expiresIn: number): number {
     return Math.min(Math.max(expiresIn, minExpiresInSeconds), maxExpiresInSeconds);
@@ -168,9 +203,15 @@ export function wrapOAuthClientProvider(
       );
     }
 
+    // B1: stamp `issuer`, same as the SDK's own auth() does after a fresh
+    // registration (auth.js `clientInformation = { ...fullInformation, issuer }`).
+    // The SDK's own bindClientInformation() would repair a missing stamp
+    // later anyway, but stamping it here keeps our own saveClientInformation
+    // delegation consistent with what saveTokens does for A3's sake.
+    const stamped: OAuthClientInformationFull = { ...registered, issuer: configuredIssuer };
     // `provider.saveClientInformation` is guaranteed to exist: checked at wrap time above.
-    await provider.saveClientInformation!(registered);
-    return registered;
+    await provider.saveClientInformation!(stamped);
+    return stamped;
   }
 
   async function tokens(): Promise<OAuthTokens | undefined> {
@@ -212,22 +253,52 @@ export function wrapOAuthClientProvider(
       );
     }
 
-    const refreshed = await refreshNow(stored);
-    return refreshed ?? stored;
+    return refreshNow(stored);
   }
 
   async function loadExpiryFromStore(): Promise<number | undefined> {
     if (!expiryStore) return undefined;
-    try {
-      return await expiryStore.get(resourceKey);
-    } catch {
-      // A failing read is no worse than not having a store configured at
-      // all — degrade to the no-adapter default rather than blocking tokens().
-      return undefined;
+    // Bajo-2: dedupe concurrent cold reads the same way refreshes are deduped.
+    if (!expiryLoad) {
+      expiryLoad = (async () => {
+        let raw: number | undefined;
+        try {
+          raw = await expiryStore.get(resourceKey);
+        } catch {
+          // A failing read is no worse than not having a store configured at
+          // all — degrade to the no-adapter default rather than blocking tokens().
+          return undefined;
+        }
+        if (raw === undefined) return undefined;
+
+        if (!isFiniteNumber(raw)) {
+          // M2: never let a bad value disable proactive refresh forever in
+          // silence — warn once, then treat it exactly like "unknown".
+          if (!warnedInvalidExpiryValue) {
+            warnedInvalidExpiryValue = true;
+            // eslint-disable-next-line no-console
+            console.warn(
+              `[mcp-auth-kit] expiryStore.get("${resourceKey}") returned a non-finite value; treating expiry as unknown for this process.`,
+            );
+          }
+          return undefined;
+        }
+
+        // M2: same clamp philosophy as a server-supplied expires_in — guard
+        // against a corrupted/malicious store value claiming the token is
+        // valid essentially forever (or, symmetrically, an implausibly-huge
+        // negative TTL), by clamping the implied TTL to the same configured bounds.
+        const impliedTtlSeconds = (raw - Date.now()) / 1000;
+        const clampedTtlSeconds = clampExpiresInSeconds(impliedTtlSeconds);
+        return Date.now() + clampedTtlSeconds * 1000;
+      })().finally(() => {
+        expiryLoad = undefined;
+      });
     }
+    return expiryLoad;
   }
 
-  function refreshNow(stored: OAuthTokens): Promise<OAuthTokens | undefined> {
+  function refreshNow(stored: OAuthTokens): Promise<OAuthTokens> {
     if (!refreshing) {
       refreshing = performRefresh(stored).finally(() => {
         refreshing = undefined;
@@ -246,14 +317,21 @@ export function wrapOAuthClientProvider(
       );
     }
 
-    if (clientInfo.issuer !== undefined && clientInfo.issuer !== configuredIssuer) {
+    // B2: compare issuers the same way the SDK itself does (issuersMatch —
+    // tolerant of a trailing-slash difference and URL normalization), not
+    // with raw string equality. The SDK's own fallback authorization server
+    // URL (when RFC 9728 discovery isn't available) is always slash-suffixed
+    // (`String(new URL('/', serverUrl))`), so a strict `!==` here would
+    // false-positive on exactly the configuration this package tells users
+    // to use.
+    if (clientInfo.issuer !== undefined && !issuersMatch(clientInfo.issuer, configuredIssuer)) {
       throw new McpAuthKitError(
         'token_refresh',
         `Refusing to refresh: the stored client is bound to authorization server "${sanitizeForMessage(clientInfo.issuer)}", but this wrapper is configured for "${configuredIssuer}"`,
         'reconfigure authorizationServerUrl to match the client\'s issuer, or re-register the client against the configured authorization server — mcp-auth-kit will not send a refresh_token or client credentials to a mismatched issuer',
       );
     }
-    if (stored.issuer !== undefined && stored.issuer !== configuredIssuer) {
+    if (stored.issuer !== undefined && !issuersMatch(stored.issuer, configuredIssuer)) {
       throw new McpAuthKitError(
         'token_refresh',
         `Refusing to refresh: the stored tokens were issued by "${sanitizeForMessage(stored.issuer)}", but this wrapper is configured for "${configuredIssuer}"`,
@@ -278,8 +356,17 @@ export function wrapOAuthClientProvider(
         sanitizedCause(error),
       );
     }
-    await saveTokens(refreshed);
-    return refreshed;
+
+    // B1: stamp `issuer` before persisting, same as the SDK's own auth()
+    // does (`await provider.saveTokens({ ...tokens, issuer })`,
+    // auth.js:336/:361). refreshAuthorization() parses the response with a
+    // schema that OMITS `issuer` (auth.js `TokenResponseSchema =
+    // OAuthTokensSchema.omit({ issuer: true })`), so without this, every
+    // refresh mcp-auth-kit performs would silently erase the stamp that A3's
+    // issuer-binding check depends on, disabling that check on its first use.
+    const stamped: OAuthTokens = { ...refreshed, issuer: configuredIssuer };
+    await saveTokens(stamped);
+    return stamped;
   }
 
   async function saveTokens(newTokens: OAuthTokens): Promise<void> {
@@ -295,7 +382,15 @@ export function wrapOAuthClientProvider(
     expiresAt = Date.now() + ttlMs;
     expiryStoreChecked = true;
     if (expiryStore) {
-      await expiryStore.set(resourceKey, expiresAt);
+      // M4: the wrapped provider's own save already succeeded above — an
+      // optional, supplementary expiry cache failing to write must not turn
+      // that success into a thrown error. Degrade to in-memory-only tracking
+      // for the rest of this process instead.
+      try {
+        await expiryStore.set(resourceKey, expiresAt);
+      } catch {
+        // best-effort; expiresAt is still tracked in memory for this instance.
+      }
     }
   }
 
@@ -338,12 +433,27 @@ export function wrapOAuthClientProvider(
     };
   }
   if (provider.invalidateCredentials) {
-    wrapped.invalidateCredentials = (scope) => {
+    wrapped.invalidateCredentials = async (scope) => {
       if (scope === 'all' || scope === 'tokens') {
         expiresAt = undefined;
         // Force the next tokens() call to re-consult expiryStore rather than
         // trusting a cached "nothing to check" from before the invalidation.
         expiryStoreChecked = false;
+        if (expiryStore) {
+          // M5: an un-deleted persisted expiry would otherwise outlive the
+          // credentials it described — remove it, or if the store can't
+          // delete, overwrite it with a sentinel that reads as "already
+          // expired" rather than leaving the stale (still-valid-looking) value.
+          try {
+            if (expiryStore.delete) {
+              await expiryStore.delete(resourceKey);
+            } else {
+              await expiryStore.set(resourceKey, 0);
+            }
+          } catch {
+            // best-effort cleanup; in-memory state is already cleared above.
+          }
+        }
       }
       return provider.invalidateCredentials!(scope);
     };
