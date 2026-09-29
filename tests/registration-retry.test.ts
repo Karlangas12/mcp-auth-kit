@@ -76,4 +76,85 @@ describe('dynamic client registration retry (openai/codex#13200)', () => {
     });
     expect(fetchFn).toHaveBeenCalledTimes(3);
   });
+
+  // M10: a definitive rejection (bad client metadata) will fail identically
+  // no matter how many times it's retried — retrying just wastes time and
+  // hammers the server.
+  it('does not retry a definitive 400 invalid_client_metadata rejection', async () => {
+    const fetchFn = vi.fn(async () => errorResponse(400, 'invalid_client_metadata'));
+
+    const inner = new InMemoryProvider(testClientMetadata);
+    const wrapped = wrapOAuthClientProvider(inner, {
+      authorizationServerUrl,
+      fetchFn: fetchFn as unknown as typeof fetch,
+      registration: {
+        maxAttempts: 5,
+        baseDelayMs: 1,
+        maxDelayMs: 5,
+        sleep: () => Promise.resolve(),
+      },
+    });
+
+    await expect(wrapped.clientInformation()).rejects.toMatchObject({
+      phase: 'client_registration',
+    });
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry unauthorized_client either', async () => {
+    const fetchFn = vi.fn(async () => errorResponse(401, 'unauthorized_client'));
+
+    const inner = new InMemoryProvider(testClientMetadata);
+    const wrapped = wrapOAuthClientProvider(inner, {
+      authorizationServerUrl,
+      fetchFn: fetchFn as unknown as typeof fetch,
+      registration: { maxAttempts: 5, baseDelayMs: 1, sleep: () => Promise.resolve() },
+    });
+
+    await expect(wrapped.clientInformation()).rejects.toMatchObject({
+      phase: 'client_registration',
+    });
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries a network failure (no HTTP response at all)', async () => {
+    let attempts = 0;
+    const fetchFn = vi.fn(async () => {
+      attempts += 1;
+      if (attempts < 2) throw new TypeError('network error');
+      return jsonResponse({ client_id: 'recovered-client-id', ...testClientMetadata });
+    });
+
+    const inner = new InMemoryProvider(testClientMetadata);
+    const wrapped = wrapOAuthClientProvider(inner, {
+      authorizationServerUrl,
+      fetchFn: fetchFn as unknown as typeof fetch,
+      registration: { maxAttempts: 3, baseDelayMs: 1, sleep: () => Promise.resolve() },
+    });
+
+    const info = await wrapped.clientInformation();
+    expect(info?.client_id).toBe('recovered-client-id');
+    expect(attempts).toBe(2);
+  });
+
+  // A5: mcp-auth-kit must refuse to auto-register a client it cannot persist,
+  // rather than silently discarding the registration on every call (which
+  // would re-register a brand new client with the AS every single time).
+  it('refuses to enable auto-registration against a provider with no saveClientInformation', () => {
+    const inner = new InMemoryProvider(testClientMetadata, { canSaveClientInformation: false });
+
+    expect(() =>
+      wrapOAuthClientProvider(inner, {
+        authorizationServerUrl,
+        registration: { maxAttempts: 3 },
+      }),
+    ).toThrow(/saveClientInformation/);
+  });
+
+  it('does not define saveClientInformation on the wrapper when the inner provider has none', () => {
+    const inner = new InMemoryProvider(testClientMetadata, { canSaveClientInformation: false });
+    const wrapped = wrapOAuthClientProvider(inner, { authorizationServerUrl });
+
+    expect(wrapped.saveClientInformation).toBeUndefined();
+  });
 });

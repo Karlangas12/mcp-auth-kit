@@ -6,13 +6,42 @@ import type {
   OAuthTokens,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 
+export interface InMemoryProviderOptions {
+  /** Set to give this provider RFC 8707 resource validation of its own. */
+  validateResourceURL?: (serverUrl: string | URL, resource?: string) => Promise<URL | undefined>;
+  /** Set to give this provider an OAuth2 `state` implementation. */
+  state?: () => string | Promise<string>;
+  /** When false, this provider cannot persist client information at all (no saveClientInformation). */
+  canSaveClientInformation?: boolean;
+}
+
 /** A minimal, fully in-memory OAuthClientProvider, the kind real MCP clients write. */
 export class InMemoryProvider implements OAuthClientProvider {
   private _clientInformation: OAuthClientInformationMixed | undefined;
   private _tokens: OAuthTokens | undefined;
   private _codeVerifier = 'test-code-verifier';
+  private readonly _opts: InMemoryProviderOptions;
+  redirectToAuthorizationCalls: URL[] = [];
+  validateResourceURLCalls: Array<{ serverUrl: string | URL; resource?: string }> = [];
 
-  constructor(private readonly metadata: OAuthClientMetadata) {}
+  constructor(
+    private readonly metadata: OAuthClientMetadata,
+    opts: InMemoryProviderOptions = {},
+  ) {
+    this._opts = opts;
+    if (opts.validateResourceURL) {
+      this.validateResourceURL = async (serverUrl, resource) => {
+        this.validateResourceURLCalls.push({ serverUrl, resource });
+        return opts.validateResourceURL!(serverUrl, resource);
+      };
+    }
+    if (opts.state) {
+      this.state = opts.state;
+    }
+    if (opts.canSaveClientInformation === false) {
+      this.saveClientInformation = undefined as unknown as InMemoryProvider['saveClientInformation'];
+    }
+  }
 
   get redirectUrl() {
     return 'https://client.example.com/callback';
@@ -26,7 +55,7 @@ export class InMemoryProvider implements OAuthClientProvider {
     return this._clientInformation;
   }
 
-  saveClientInformation(info: OAuthClientInformationMixed) {
+  saveClientInformation?(info: OAuthClientInformationMixed) {
     this._clientInformation = info;
   }
 
@@ -38,8 +67,8 @@ export class InMemoryProvider implements OAuthClientProvider {
     this._tokens = tokens;
   }
 
-  redirectToAuthorization() {
-    /* no-op in tests */
+  redirectToAuthorization(authorizationUrl: URL) {
+    this.redirectToAuthorizationCalls.push(authorizationUrl);
   }
 
   saveCodeVerifier(codeVerifier: string) {
@@ -49,6 +78,11 @@ export class InMemoryProvider implements OAuthClientProvider {
   codeVerifier() {
     return this._codeVerifier;
   }
+
+  // Assigned conditionally in the constructor based on opts; declared here so
+  // TypeScript knows the (optional) interface members can exist on instances.
+  validateResourceURL?: OAuthClientProvider['validateResourceURL'];
+  state?: OAuthClientProvider['state'];
 
   /** Test helper, not part of the interface. */
   presetClientInformation(info: OAuthClientInformationFull) {
@@ -83,3 +117,72 @@ export const testClientInformation: OAuthClientInformationFull = {
   client_id: 'test-client-id',
   ...testClientMetadata,
 };
+
+// ---------------------------------------------------------------------------
+// Mock authorization/resource server, for tests that drive the SDK's real
+// auth() orchestrator end to end instead of only exercising wrapper methods
+// in isolation.
+// ---------------------------------------------------------------------------
+
+export interface MockServerConfig {
+  mcpServerUrl: string; // e.g. 'https://mcp.example.com'
+  authorizationServerUrl: string; // e.g. 'https://auth.example.com'
+  /** The `resource` value the protected-resource metadata document advertises. */
+  protectedResource: string;
+  registrationResponse?: OAuthClientInformationFull | { status: number; body: unknown };
+}
+
+/**
+ * A `fetchFn` implementation that answers the well-known discovery endpoints
+ * and the registration endpoint the SDK's `auth()` hits during the discovery
+ * + (optional) registration + redirect-to-authorization phase, i.e.
+ * everything up to (not including) the authorization-code exchange.
+ */
+export function createMockAuthServer(config: MockServerConfig) {
+  const calls: Array<{ url: string; method: string }> = [];
+
+  const fetchFn = async (url: string | URL, init?: RequestInit): Promise<Response> => {
+    const u = new URL(url);
+    const method = init?.method ?? 'GET';
+    calls.push({ url: u.toString(), method });
+
+    if (u.pathname === '/.well-known/oauth-protected-resource' && method === 'GET') {
+      return jsonResponse({
+        resource: config.protectedResource,
+        authorization_servers: [config.authorizationServerUrl],
+      });
+    }
+
+    if (u.pathname === '/.well-known/oauth-authorization-server' && method === 'GET') {
+      return jsonResponse({
+        issuer: config.authorizationServerUrl,
+        authorization_endpoint: `${config.authorizationServerUrl}/authorize`,
+        token_endpoint: `${config.authorizationServerUrl}/token`,
+        registration_endpoint: `${config.authorizationServerUrl}/register`,
+        response_types_supported: ['code'],
+        code_challenge_methods_supported: ['S256'],
+      });
+    }
+
+    if (u.pathname === '/.well-known/openid-configuration') {
+      return new Response('not found', { status: 404 });
+    }
+
+    if (u.pathname === '/register' && method === 'POST') {
+      const resp = config.registrationResponse;
+      if (resp && 'status' in resp) {
+        return jsonResponse(resp.body, { status: resp.status });
+      }
+      return jsonResponse(
+        resp ?? {
+          client_id: 'dcr-client-id',
+          ...testClientMetadata,
+        },
+      );
+    }
+
+    return new Response('not found', { status: 404 });
+  };
+
+  return { fetchFn, calls };
+}

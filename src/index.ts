@@ -5,3 +5,6 @@ export type { McpAuthKitErrorPhase } from './errors.js';
 export { normalizeResourceIndicator } from './resource.js';
 export { withExponentialBackoff } from './retry.js';
 export type { BackoffOptions } from './retry.js';
+export { isRetryableOAuthError } from './classifyError.js';
+export { sanitizeForMessage } from './sanitize.js';
+export { withTimeout } from './fetchTimeout.js';

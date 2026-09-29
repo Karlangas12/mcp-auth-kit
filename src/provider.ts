@@ -10,8 +10,11 @@ import type {
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js';
 
+import { isRetryableOAuthError } from './classifyError.js';
 import { McpAuthKitError } from './errors.js';
+import { withTimeout } from './fetchTimeout.js';
 import { normalizeResourceIndicator } from './resource.js';
+import { sanitizeForMessage, sanitizedCause } from './sanitize.js';
 import { withExponentialBackoff, type BackoffOptions } from './retry.js';
 
 export interface McpAuthKitOptions {
@@ -32,11 +35,32 @@ export interface McpAuthKitOptions {
    */
   refreshMarginMs?: number;
   /**
+   * Lower bound, in seconds, clamped onto a server-supplied `expires_in`
+   * before it's trusted. Guards against a server sending `0` or a negative
+   * value, which would otherwise trigger a refresh on every single call.
+   * Default: 30.
+   */
+  minExpiresInSeconds?: number;
+  /**
+   * Upper bound, in seconds, clamped onto a server-supplied `expires_in`
+   * before it's trusted. Guards against an unreasonably large value leaving
+   * a token that's actually been revoked looking valid indefinitely.
+   * Default: 30 days.
+   */
+  maxExpiresInSeconds?: number;
+  /**
+   * Timeout, in ms, applied to every HTTP call mcp-auth-kit makes on the
+   * client's behalf (registration, token refresh). A hung authorization
+   * server must not be able to block the whole MCP client. Default: 30000.
+   */
+  timeoutMs?: number;
+  /**
    * When set, enables auto dynamic-client-registration-with-retry: if the
    * wrapped provider has no stored client information, mcp-auth-kit performs
-   * RFC 7591 registration itself (with exponential backoff) instead of
-   * leaving a single unretried attempt to fail hard
-   * (openai/codex#13200).
+   * RFC 7591 registration itself, retrying only transient failures with
+   * exponential backoff (openai/codex#13200). Requires the wrapped provider
+   * to implement `saveClientInformation` — mcp-auth-kit refuses to register
+   * a client it cannot persist.
    */
   registration?: BackoffOptions;
   /** RFC 8707 resource indicator to send with token requests, pre-normalization. */
@@ -49,6 +73,14 @@ export interface McpAuthKitOptions {
  * dynamic client registration, RFC 8707 `resource` normalization, and typed
  * errors instead of silent failures.
  *
+ * The returned provider only defines the OPTIONAL members of
+ * {@link OAuthClientProvider} that the wrapped provider itself defines. The
+ * SDK's `auth()` orchestrator uses *presence* of these methods as
+ * feature-detection (e.g. to decide whether its own `resource`-matching
+ * validation runs, or whether `state()` is generated) — defining them
+ * unconditionally would silently disable security checks the wrapped
+ * provider never asked to opt out of, or crash flows it never opted into.
+ *
  * The returned provider is a drop-in replacement: pass it anywhere the
  * wrapped provider was used (e.g. `new Client(...).connect(transport, {
  * authProvider })` or the SDK's `auth()` orchestrator).
@@ -57,96 +89,73 @@ export function wrapOAuthClientProvider(
   provider: OAuthClientProvider,
   options: McpAuthKitOptions,
 ): OAuthClientProvider {
-  return new McpAuthKitProvider(provider, options);
-}
+  const authorizationServerUrl = options.authorizationServerUrl;
+  const configuredIssuer = String(authorizationServerUrl);
+  const fallbackTokenTtlMs = options.fallbackTokenTtlMs ?? 55 * 60 * 1000;
+  const refreshMarginMs = options.refreshMarginMs ?? 30 * 1000;
+  const minExpiresInSeconds = options.minExpiresInSeconds ?? 30;
+  const maxExpiresInSeconds = options.maxExpiresInSeconds ?? 30 * 24 * 60 * 60;
+  const timeoutMs = options.timeoutMs ?? 30 * 1000;
+  const registrationOptions = options.registration;
+  const resource = options.resource;
+  const fetchFn = withTimeout(options.fetchFn, timeoutMs);
 
-class McpAuthKitProvider implements OAuthClientProvider {
-  private readonly inner: OAuthClientProvider;
-  private readonly authorizationServerUrl: string | URL;
-  private readonly fetchFn: FetchLike | undefined;
-  private readonly fallbackTokenTtlMs: number;
-  private readonly refreshMarginMs: number;
-  private readonly registrationOptions: BackoffOptions | undefined;
-  private readonly resource: string | URL | undefined;
+  if (registrationOptions && !provider.saveClientInformation) {
+    throw new McpAuthKitError(
+      'client_registration',
+      'Auto dynamic-client-registration was requested via the `registration` option, but the wrapped provider does not implement saveClientInformation',
+      'implement saveClientInformation on the wrapped provider so a newly registered client can actually be persisted, or omit the `registration` option and register the client yourself',
+    );
+  }
 
   /** Wall-clock ms at which the current access token is considered expired. */
-  private expiresAt: number | undefined;
+  let expiresAt: number | undefined;
   /** In-flight refresh, so concurrent tokens() calls share one refresh request. */
-  private refreshing: Promise<OAuthTokens | undefined> | undefined;
+  let refreshing: Promise<OAuthTokens | undefined> | undefined;
 
-  constructor(provider: OAuthClientProvider, options: McpAuthKitOptions) {
-    this.inner = provider;
-    this.authorizationServerUrl = options.authorizationServerUrl;
-    this.fetchFn = options.fetchFn;
-    this.fallbackTokenTtlMs = options.fallbackTokenTtlMs ?? 55 * 60 * 1000;
-    this.refreshMarginMs = options.refreshMarginMs ?? 30 * 1000;
-    this.registrationOptions = options.registration;
-    this.resource = options.resource;
+  function clampExpiresInSeconds(expiresIn: number): number {
+    return Math.min(Math.max(expiresIn, minExpiresInSeconds), maxExpiresInSeconds);
   }
 
-  get redirectUrl(): string | URL | undefined {
-    return this.inner.redirectUrl;
-  }
-
-  get clientMetadata() {
-    return this.inner.clientMetadata;
-  }
-
-  state(): string | Promise<string> {
-    if (!this.inner.state) {
-      throw new McpAuthKitError(
-        'authorization',
-        'state() was called but the wrapped provider does not implement it',
-        'implement state() on the wrapped provider, or omit calling it',
-      );
-    }
-    return this.inner.state();
-  }
-
-  async clientInformation(): Promise<OAuthClientInformationMixed | undefined> {
-    const existing = await this.inner.clientInformation();
+  async function clientInformation(): Promise<OAuthClientInformationMixed | undefined> {
+    const existing = await provider.clientInformation();
     if (existing) return existing;
-    if (!this.registrationOptions) return undefined;
+    if (!registrationOptions) return undefined;
 
     let registered: OAuthClientInformationFull;
     try {
       registered = await withExponentialBackoff(
         () =>
-          registerClient(this.authorizationServerUrl, {
-            clientMetadata: this.inner.clientMetadata,
-            fetchFn: this.fetchFn,
+          registerClient(authorizationServerUrl, {
+            clientMetadata: provider.clientMetadata,
+            fetchFn,
           }),
-        this.registrationOptions,
+        { ...registrationOptions, shouldRetry: isRetryableOAuthError },
       );
     } catch (error) {
       throw new McpAuthKitError(
         'client_registration',
-        `Dynamic client registration (RFC 7591) failed after ${this.registrationOptions.maxAttempts ?? 3} attempt(s)`,
+        `Dynamic client registration (RFC 7591) failed after ${registrationOptions.maxAttempts ?? 3} attempt(s)`,
         'verify the authorization server advertises a registration_endpoint and supports dynamic client registration, or pre-register a client and provide clientInformation() statically instead of relying on auto-registration',
-        error,
+        sanitizedCause(error),
       );
     }
 
-    await this.inner.saveClientInformation?.(registered);
+    // `provider.saveClientInformation` is guaranteed to exist: checked at wrap time above.
+    await provider.saveClientInformation!(registered);
     return registered;
   }
 
-  saveClientInformation(
-    clientInformation: OAuthClientInformationMixed,
-  ): void | Promise<void> {
-    return this.inner.saveClientInformation?.(clientInformation);
-  }
-
-  async tokens(): Promise<OAuthTokens | undefined> {
-    const stored = await this.inner.tokens();
+  async function tokens(): Promise<OAuthTokens | undefined> {
+    const stored = await provider.tokens();
     if (!stored) return undefined;
 
     const needsRefresh =
-      this.expiresAt === undefined || Date.now() >= this.expiresAt - this.refreshMarginMs;
+      expiresAt === undefined || Date.now() >= expiresAt - refreshMarginMs;
     if (!needsRefresh) return stored;
 
     if (!stored.refresh_token) {
-      if (this.expiresAt === undefined) {
+      if (expiresAt === undefined) {
         // We have no basis to know this token is actually stale (e.g. it was
         // never saved through this wrapper) and no refresh_token to renew it
         // with anyway — pass it through rather than blocking every call.
@@ -159,22 +168,22 @@ class McpAuthKitProvider implements OAuthClientProvider {
       );
     }
 
-    const refreshed = await this.refreshNow(stored);
+    const refreshed = await refreshNow(stored);
     return refreshed ?? stored;
   }
 
-  private refreshNow(stored: OAuthTokens): Promise<OAuthTokens | undefined> {
-    if (!this.refreshing) {
-      this.refreshing = this.performRefresh(stored).finally(() => {
-        this.refreshing = undefined;
+  function refreshNow(stored: OAuthTokens): Promise<OAuthTokens | undefined> {
+    if (!refreshing) {
+      refreshing = performRefresh(stored).finally(() => {
+        refreshing = undefined;
       });
     }
-    return this.refreshing;
+    return refreshing;
   }
 
-  private async performRefresh(stored: OAuthTokens): Promise<OAuthTokens> {
-    const clientInformation = await this.inner.clientInformation();
-    if (!clientInformation) {
+  async function performRefresh(stored: OAuthTokens): Promise<OAuthTokens> {
+    const clientInfo = await provider.clientInformation();
+    if (!clientInfo) {
       throw new McpAuthKitError(
         'token_refresh',
         'Cannot refresh the access token because no client information is registered',
@@ -182,77 +191,110 @@ class McpAuthKitProvider implements OAuthClientProvider {
       );
     }
 
+    if (clientInfo.issuer !== undefined && clientInfo.issuer !== configuredIssuer) {
+      throw new McpAuthKitError(
+        'token_refresh',
+        `Refusing to refresh: the stored client is bound to authorization server "${sanitizeForMessage(clientInfo.issuer)}", but this wrapper is configured for "${configuredIssuer}"`,
+        'reconfigure authorizationServerUrl to match the client\'s issuer, or re-register the client against the configured authorization server — mcp-auth-kit will not send a refresh_token or client credentials to a mismatched issuer',
+      );
+    }
+    if (stored.issuer !== undefined && stored.issuer !== configuredIssuer) {
+      throw new McpAuthKitError(
+        'token_refresh',
+        `Refusing to refresh: the stored tokens were issued by "${sanitizeForMessage(stored.issuer)}", but this wrapper is configured for "${configuredIssuer}"`,
+        'do not reuse a single mcp-auth-kit wrapper instance across multiple authorization servers; discard the stored tokens and re-authorize against the configured authorizationServerUrl',
+      );
+    }
+
+    let refreshed: OAuthTokens;
     try {
-      const refreshed = await refreshAuthorization(this.authorizationServerUrl, {
-        clientInformation,
+      refreshed = await refreshAuthorization(authorizationServerUrl, {
+        clientInformation: clientInfo,
         refreshToken: stored.refresh_token as string,
-        resource: this.resource,
-        addClientAuthentication: this.inner.addClientAuthentication,
-        fetchFn: this.fetchFn,
+        resource,
+        addClientAuthentication: provider.addClientAuthentication,
+        fetchFn,
       });
-      await this.saveTokens(refreshed);
-      return refreshed;
     } catch (error) {
       throw new McpAuthKitError(
         'token_refresh',
         'Refreshing the access token via the refresh_token grant failed',
         'the refresh_token may have been revoked or expired; discard stored tokens and re-run the authorization code flow',
-        error,
+        sanitizedCause(error),
       );
     }
+    await saveTokens(refreshed);
+    return refreshed;
   }
 
-  async saveTokens(tokens: OAuthTokens): Promise<void> {
-    const ttlMs = tokens.expires_in !== undefined ? tokens.expires_in * 1000 : this.fallbackTokenTtlMs;
-    this.expiresAt = Date.now() + ttlMs;
-    await this.inner.saveTokens(tokens);
+  async function saveTokens(newTokens: OAuthTokens): Promise<void> {
+    // Persist first: if the wrapped provider's storage fails, propagate the
+    // error and leave `expiresAt` untouched rather than believing a token
+    // was saved when it wasn't (which would silently serve a stale token
+    // forever afterward).
+    await provider.saveTokens(newTokens);
+    const ttlMs =
+      newTokens.expires_in !== undefined
+        ? clampExpiresInSeconds(newTokens.expires_in) * 1000
+        : fallbackTokenTtlMs;
+    expiresAt = Date.now() + ttlMs;
   }
 
-  redirectToAuthorization(authorizationUrl: URL): void | Promise<void> {
-    return this.inner.redirectToAuthorization(authorizationUrl);
+  const wrapped: OAuthClientProvider = {
+    get redirectUrl() {
+      return provider.redirectUrl;
+    },
+    get clientMetadata() {
+      return provider.clientMetadata;
+    },
+    clientInformation,
+    tokens,
+    saveTokens,
+    redirectToAuthorization: (authorizationUrl) => provider.redirectToAuthorization(authorizationUrl),
+    saveCodeVerifier: (codeVerifier) => provider.saveCodeVerifier(codeVerifier),
+    codeVerifier: () => provider.codeVerifier(),
+  };
+
+  // Every member below is defined ONLY if the wrapped provider defines it —
+  // see the feature-detection note in the doc comment above.
+  if (provider.clientMetadataUrl !== undefined) {
+    wrapped.clientMetadataUrl = provider.clientMetadataUrl;
+  }
+  if (provider.state) {
+    wrapped.state = () => provider.state!();
+  }
+  if (provider.saveClientInformation) {
+    wrapped.saveClientInformation = (info) => provider.saveClientInformation!(info);
+  }
+  if (provider.addClientAuthentication) {
+    wrapped.addClientAuthentication = provider.addClientAuthentication;
+  }
+  if (provider.validateResourceURL) {
+    wrapped.validateResourceURL = (serverUrl, res) => {
+      const normalized = res !== undefined ? normalizeResourceIndicator(res) : undefined;
+      // The wrapped provider is the one asserting the resource is valid for
+      // its own server — we only pre-normalize the trailing slash for it,
+      // we never invent or weaken that validation ourselves.
+      return provider.validateResourceURL!(serverUrl, normalized);
+    };
+  }
+  if (provider.invalidateCredentials) {
+    wrapped.invalidateCredentials = (scope) => {
+      if (scope === 'all' || scope === 'tokens') {
+        expiresAt = undefined;
+      }
+      return provider.invalidateCredentials!(scope);
+    };
+  }
+  if (provider.prepareTokenRequest) {
+    wrapped.prepareTokenRequest = (scope) => provider.prepareTokenRequest!(scope);
+  }
+  if (provider.saveDiscoveryState) {
+    wrapped.saveDiscoveryState = (state) => provider.saveDiscoveryState!(state);
+  }
+  if (provider.discoveryState) {
+    wrapped.discoveryState = () => provider.discoveryState!();
   }
 
-  saveCodeVerifier(codeVerifier: string): void | Promise<void> {
-    return this.inner.saveCodeVerifier(codeVerifier);
-  }
-
-  codeVerifier(): string | Promise<string> {
-    return this.inner.codeVerifier();
-  }
-
-  get addClientAuthentication() {
-    return this.inner.addClientAuthentication;
-  }
-
-  async validateResourceURL(
-    serverUrl: string | URL,
-    resource?: string,
-  ): Promise<URL | undefined> {
-    const normalized = resource !== undefined ? normalizeResourceIndicator(resource) : undefined;
-
-    if (this.inner.validateResourceURL) {
-      return this.inner.validateResourceURL(serverUrl, normalized);
-    }
-    if (normalized === undefined) return undefined;
-
-    try {
-      return new URL(normalized);
-    } catch (error) {
-      throw new McpAuthKitError(
-        'resource_validation',
-        `The resource indicator "${resource}" is not a valid absolute URL`,
-        'ensure the MCP server (or its protected resource metadata) advertises a well-formed resource identifier',
-        error,
-      );
-    }
-  }
-
-  invalidateCredentials(
-    scope: 'all' | 'client' | 'tokens' | 'verifier' | 'discovery',
-  ): void | Promise<void> {
-    if (scope === 'all' || scope === 'tokens') {
-      this.expiresAt = undefined;
-    }
-    return this.inner.invalidateCredentials?.(scope);
-  }
+  return wrapped;
 }

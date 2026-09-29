@@ -22,8 +22,22 @@ describe('resource indicator trailing-slash normalization (claude-code#52871)', 
     expect(new URL('https://mcp.example.com').href).toBe('https://mcp.example.com/');
   });
 
-  it('validateResourceURL on the wrapped provider strips a spurious trailing slash on the path', async () => {
+  it('does not define validateResourceURL when the wrapped provider has none of its own', () => {
+    // Defining it unconditionally would bypass the SDK's own checkResourceAllowed
+    // validation (see the auth()-integration regression test for C1).
     const inner = new InMemoryProvider(testClientMetadata);
+    const wrapped = wrapOAuthClientProvider(inner, {
+      authorizationServerUrl: 'https://auth.example.com',
+    });
+
+    expect(wrapped.validateResourceURL).toBeUndefined();
+  });
+
+  it('pre-normalizes the resource before delegating to a provider that DOES implement validateResourceURL', async () => {
+    const inner = new InMemoryProvider(testClientMetadata, {
+      validateResourceURL: async (_serverUrl, resource) =>
+        resource !== undefined ? new URL(resource) : undefined,
+    });
     const wrapped = wrapOAuthClientProvider(inner, {
       authorizationServerUrl: 'https://auth.example.com',
     });
@@ -34,6 +48,12 @@ describe('resource indicator trailing-slash normalization (claude-code#52871)', 
     );
 
     expect(result?.href).toBe('https://mcp.example.com/mcp');
+    // The inner provider's own validation actually ran and received the
+    // already-normalized string — mcp-auth-kit never invents validation of
+    // its own that the wrapped provider didn't already opt into.
+    expect(inner.validateResourceURLCalls).toEqual([
+      { serverUrl: 'https://mcp.example.com/mcp', resource: 'https://mcp.example.com/mcp' },
+    ]);
   });
 
   it('the normalized resource (no trailing slash) is what actually gets sent on refresh', async () => {

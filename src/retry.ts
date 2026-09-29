@@ -7,15 +7,29 @@ export interface BackoffOptions {
   maxDelayMs?: number;
   /** Injectable sleep function, for tests. Defaults to real timers. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Decides whether a given error is worth retrying. Defaults to "retry
+   * everything" — callers dealing with a classifiable error type (e.g. OAuth
+   * errors, HTTP responses) should narrow this to transient failures only.
+   */
+  shouldRetry?: (error: unknown) => boolean;
+  /**
+   * Random jitter applied to each delay, as a fraction of the computed delay
+   * (0 = none, 0.2 = ±10%). Default 0.2. Avoids synchronized retry storms
+   * across multiple clients backing off in lockstep.
+   */
+  jitter?: number;
+  /** Injectable randomness source, for deterministic tests. Defaults to Math.random. */
+  random?: () => number;
 }
 
 const defaultSleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Retries `fn` with exponential backoff (delay doubles each attempt, no
- * jitter) until it succeeds or `maxAttempts` is exhausted, in which case the
- * last error is rethrown.
+ * Retries `fn` with exponential backoff (delay doubles each attempt) plus
+ * jitter, until it succeeds, `shouldRetry` rejects an error, or `maxAttempts`
+ * is exhausted — in which case the last error is rethrown.
  */
 export async function withExponentialBackoff<T>(
   fn: (attempt: number) => Promise<T>,
@@ -25,17 +39,20 @@ export async function withExponentialBackoff<T>(
   const baseDelayMs = options.baseDelayMs ?? 250;
   const maxDelayMs = options.maxDelayMs ?? 5000;
   const sleep = options.sleep ?? defaultSleep;
+  const shouldRetry = options.shouldRetry ?? (() => true);
+  const jitter = options.jitter ?? 0.2;
+  const random = options.random ?? Math.random;
 
-  let lastError: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       return await fn(attempt);
     } catch (error) {
-      lastError = error;
-      if (attempt === maxAttempts) break;
-      const delay = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
-      await sleep(delay);
+      if (attempt === maxAttempts || !shouldRetry(error)) throw error;
+      const rawDelay = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
+      const jitterFactor = 1 + (random() * 2 - 1) * (jitter / 2);
+      await sleep(Math.max(0, rawDelay * jitterFactor));
     }
   }
-  throw lastError;
+  // Unreachable: the loop above always returns or throws.
+  throw new Error('withExponentialBackoff: exhausted attempts without a result');
 }
