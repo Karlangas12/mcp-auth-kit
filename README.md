@@ -145,20 +145,95 @@ So: mcp-auth-kit only ever *narrows* behavior your provider already has
 - `sanitizeForMessage(value)` — strips control characters/newlines from
   untrusted text before it's used in a log line or error message.
 - `McpAuthKitError` — the typed error class, with `.phase` and `.remediation`.
+- `ExpiryStore` (type) — the interface for the optional expiry-persistence
+  adapter described below.
 
-## Known limitation: expiry tracking is in-memory only
+## Expiry persistence
 
-mcp-auth-kit tracks `expiresAt` in memory, on the wrapper instance. It does
-**not** currently persist it, which means a process that restarts (the common
-case for CLI-style MCP clients, like the ones behind the bugs this package
-fixes) starts every fresh instance with no memory of when its stored token
-actually expires. On cold start, mcp-auth-kit either refreshes proactively
-(if a `refresh_token` is present — safe, but means a refresh on every process
-start even when the access token was still perfectly valid) or falls back to
-serving the stored token with no expiry awareness at all (if there's no
-`refresh_token`). This is being tracked as an open design question — see
-`company-architecture/decisions/ADR-010-...md` for the options under
-consideration — rather than papered over with a quick fix.
+mcp-auth-kit tracks `expiresAt` on the wrapper instance. By default that's
+**in memory only** — a process restart (the common case for CLI-style MCP
+clients, like the ones behind the bugs table above) starts a fresh instance
+with no memory of when its already-stored token actually expires. There are
+two modes:
+
+### Default: no `expiryStore` configured
+
+On a cold-loaded token (`expiresAt` unknown to this instance), mcp-auth-kit
+does **not** guess and does **not** force a proactive refresh. It returns the
+stored token exactly as the wrapped provider's own `tokens()` returned it —
+whether or not that token has actually expired.
+
+This is a deliberate default, not an oversight, based on verifying how the
+SDK itself behaves on a 401 (`@modelcontextprotocol/sdk`, checked against the
+installed version in `node_modules`):
+
+- Both stock client transports react to an HTTP 401 by calling `auth()`
+  again: `StreamableHTTPClientTransport` in
+  `dist/esm/client/streamableHttp.js` (`_startOrAuthSse`, line 97, and
+  `send`, line 315), and `SSEClientTransport` in `dist/esm/client/sse.js`
+  (the `EventSource.onerror` handler, line 89, and `send`, line 176).
+- `auth()` itself, in `dist/esm/client/auth.js`, does **not** go straight to
+  a brand-new interactive login when reactively re-invoked. It first calls
+  `provider.tokens()` (line 341) and, if a `refresh_token` is present,
+  attempts a **silent** `refreshAuthorization()` grant (lines 349–362) —
+  only falling back to `startAuthorization()` +
+  `provider.redirectToAuthorization()` (lines 375–387, forcing a new
+  interactive login) if there's no `refresh_token`, or the refresh itself
+  fails with a definitive `OAuthError` other than `ServerError` (lines
+  364–373).
+
+So for any client built on those two transports, a token that's actually
+expired self-heals on the very next request — one failed round trip, then a
+silent refresh, with **no interactive re-login** — even with mcp-auth-kit
+never forcing a refresh at startup "just in case." Forcing one anyway would
+mean burning a refresh-token rotation (and an extra request to the
+authorization server) on every single process start, on the mere suspicion
+that it might be needed. A client with its own hand-rolled transport that
+does *not* replicate this 401-retry logic — which is exactly the shape of
+several of the bugs in the table above — won't get this safety net, cold
+start or not; that's a gap in that transport, not something a token-provider
+wrapper can fix from the outside.
+
+### With `expiryStore` configured
+
+Pass an `ExpiryStore` — two methods, owned by mcp-auth-kit, not part of
+`OAuthClientProvider` — to persist `expiresAt` across restarts:
+
+```ts
+import type { ExpiryStore } from 'mcp-auth-kit';
+
+const expiryStore: ExpiryStore = {
+  async get(resourceKey) {
+    /* read a persisted ms-since-epoch timestamp for resourceKey, e.g. from a file */
+  },
+  async set(resourceKey, expiresAtMs) {
+    /* persist it */
+  },
+};
+
+const authProvider = wrapOAuthClientProvider(myProvider, {
+  authorizationServerUrl: 'https://auth.example.com',
+  expiryStore,
+  // resourceKey defaults to String(authorizationServerUrl); override if one
+  // store instance needs to track more than one MCP server/session.
+});
+```
+
+With this configured, mcp-auth-kit persists `expiresAt` on every
+`saveTokens()` and consults the store before deciding whether a freshly
+loaded token needs a proactive refresh — so it can now decide correctly, with
+real knowledge, on a cold start. A failing `get()` degrades gracefully to the
+no-adapter default rather than blocking `tokens()`.
+
+### Which to use
+
+The no-adapter default is right for anything built on
+`StreamableHTTPClientTransport`/`SSEClientTransport` (or a transport that
+faithfully replicates their reactive-401 behavior) — you get self-healing for
+free and mcp-auth-kit stays out of the way. Configure `expiryStore` when you
+either can't rely on that (a custom transport, or one you can't verify
+implements the retry) or want to avoid the one-request latency hit of the
+reactive path on every cold start.
 
 ## Tests
 

@@ -12,6 +12,7 @@ import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js';
 
 import { isRetryableOAuthError } from './classifyError.js';
 import { McpAuthKitError } from './errors.js';
+import type { ExpiryStore } from './expiryStore.js';
 import { withTimeout } from './fetchTimeout.js';
 import { normalizeResourceIndicator } from './resource.js';
 import { sanitizeForMessage, sanitizedCause } from './sanitize.js';
@@ -65,6 +66,23 @@ export interface McpAuthKitOptions {
   registration?: BackoffOptions;
   /** RFC 8707 resource indicator to send with token requests, pre-normalization. */
   resource?: string | URL;
+  /**
+   * Optional store for the access-token expiry clock, so it survives a
+   * process restart. When omitted (the default), mcp-auth-kit tracks
+   * `expiresAt` in memory only, and — per the verified behavior of the
+   * SDK's own `auth()`/transport reactive-401 flow (see README "Expiry
+   * persistence") — does NOT force a proactive refresh on a token it just
+   * loaded cold. When provided, mcp-auth-kit persists `expiresAt` through it
+   * on every `saveTokens()` and consults it before deciding whether a
+   * freshly loaded token needs a proactive refresh.
+   */
+  expiryStore?: ExpiryStore;
+  /**
+   * Key under which `expiryStore` persists this session's expiry. Defaults
+   * to `String(authorizationServerUrl)`, consistent with `auth()`'s own
+   * issuer-based session scoping.
+   */
+  resourceKey?: string;
 }
 
 /**
@@ -99,6 +117,8 @@ export function wrapOAuthClientProvider(
   const registrationOptions = options.registration;
   const resource = options.resource;
   const fetchFn = withTimeout(options.fetchFn, timeoutMs);
+  const expiryStore = options.expiryStore;
+  const resourceKey = options.resourceKey ?? configuredIssuer;
 
   if (registrationOptions && !provider.saveClientInformation) {
     throw new McpAuthKitError(
@@ -110,6 +130,13 @@ export function wrapOAuthClientProvider(
 
   /** Wall-clock ms at which the current access token is considered expired. */
   let expiresAt: number | undefined;
+  /**
+   * Whether we've already asked `expiryStore` (if any) for a persisted
+   * `expiresAt` this process. Distinguishes "haven't checked yet" from
+   * "checked, and the store genuinely has nothing" — without this, a store
+   * that legitimately has no value would be re-queried on every tokens() call.
+   */
+  let expiryStoreChecked = false;
   /** In-flight refresh, so concurrent tokens() calls share one refresh request. */
   let refreshing: Promise<OAuthTokens | undefined> | undefined;
 
@@ -150,17 +177,34 @@ export function wrapOAuthClientProvider(
     const stored = await provider.tokens();
     if (!stored) return undefined;
 
-    const needsRefresh =
-      expiresAt === undefined || Date.now() >= expiresAt - refreshMarginMs;
+    if (expiresAt === undefined && !expiryStoreChecked) {
+      expiresAt = await loadExpiryFromStore();
+      expiryStoreChecked = true;
+    }
+
+    if (expiresAt === undefined) {
+      // Cold, and no (or no configured) expiry store to consult: we have no
+      // basis to know whether this token — loaded fresh from the wrapped
+      // provider's own storage, e.g. right after a process restart — is
+      // actually still valid. Pass it through as-is rather than guessing.
+      //
+      // This is safe by construction, not just by omission: per the SDK's
+      // own auth.js (verified — see README "Expiry persistence"), the stock
+      // StreamableHTTPClientTransport/SSEClientTransport both react to a 401
+      // by calling auth() again, and auth() itself attempts a silent
+      // refresh_token grant before ever falling back to a full interactive
+      // re-authorization. So a stale token loaded cold still self-heals on
+      // the very next request for any client using those transports — at
+      // the cost of one failed round trip — without mcp-auth-kit forcing a
+      // refresh (and burning a refresh-token rotation) on every single
+      // process start on the mere suspicion that it might be needed.
+      return stored;
+    }
+
+    const needsRefresh = Date.now() >= expiresAt - refreshMarginMs;
     if (!needsRefresh) return stored;
 
     if (!stored.refresh_token) {
-      if (expiresAt === undefined) {
-        // We have no basis to know this token is actually stale (e.g. it was
-        // never saved through this wrapper) and no refresh_token to renew it
-        // with anyway — pass it through rather than blocking every call.
-        return stored;
-      }
       throw new McpAuthKitError(
         'token_refresh',
         'Access token has expired and no refresh_token is available',
@@ -170,6 +214,17 @@ export function wrapOAuthClientProvider(
 
     const refreshed = await refreshNow(stored);
     return refreshed ?? stored;
+  }
+
+  async function loadExpiryFromStore(): Promise<number | undefined> {
+    if (!expiryStore) return undefined;
+    try {
+      return await expiryStore.get(resourceKey);
+    } catch {
+      // A failing read is no worse than not having a store configured at
+      // all — degrade to the no-adapter default rather than blocking tokens().
+      return undefined;
+    }
   }
 
   function refreshNow(stored: OAuthTokens): Promise<OAuthTokens | undefined> {
@@ -238,6 +293,10 @@ export function wrapOAuthClientProvider(
         ? clampExpiresInSeconds(newTokens.expires_in) * 1000
         : fallbackTokenTtlMs;
     expiresAt = Date.now() + ttlMs;
+    expiryStoreChecked = true;
+    if (expiryStore) {
+      await expiryStore.set(resourceKey, expiresAt);
+    }
   }
 
   const wrapped: OAuthClientProvider = {
@@ -282,6 +341,9 @@ export function wrapOAuthClientProvider(
     wrapped.invalidateCredentials = (scope) => {
       if (scope === 'all' || scope === 'tokens') {
         expiresAt = undefined;
+        // Force the next tokens() call to re-consult expiryStore rather than
+        // trusting a cached "nothing to check" from before the invalidation.
+        expiryStoreChecked = false;
       }
       return provider.invalidateCredentials!(scope);
     };

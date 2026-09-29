@@ -5,6 +5,29 @@ import type {
   OAuthClientMetadata,
   OAuthTokens,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
+import type { ExpiryStore } from '../src/expiryStore.js';
+
+/**
+ * A trivial in-memory ExpiryStore, standing in for whatever real persistence
+ * (a file, a keychain entry, a DB row) a caller would actually use across
+ * process restarts. Tests simulate "process restart" by keeping this store
+ * alive across two separate `wrapOAuthClientProvider` instances.
+ */
+export class InMemoryExpiryStore implements ExpiryStore {
+  private readonly values = new Map<string, number>();
+  getCalls: string[] = [];
+  setCalls: Array<{ resourceKey: string; expiresAtMs: number }> = [];
+
+  async get(resourceKey: string): Promise<number | undefined> {
+    this.getCalls.push(resourceKey);
+    return this.values.get(resourceKey);
+  }
+
+  async set(resourceKey: string, expiresAtMs: number): Promise<void> {
+    this.setCalls.push({ resourceKey, expiresAtMs });
+    this.values.set(resourceKey, expiresAtMs);
+  }
+}
 
 export interface InMemoryProviderOptions {
   /** Set to give this provider RFC 8707 resource validation of its own. */

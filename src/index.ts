@@ -1,5 +1,6 @@
 export { wrapOAuthClientProvider } from './provider.js';
 export type { McpAuthKitOptions } from './provider.js';
+export type { ExpiryStore } from './expiryStore.js';
 export { McpAuthKitError } from './errors.js';
 export type { McpAuthKitErrorPhase } from './errors.js';
 export { normalizeResourceIndicator } from './resource.js';
