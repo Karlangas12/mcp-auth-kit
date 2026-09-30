@@ -127,10 +127,23 @@ export interface McpAuthKitOptions {
    */
   refreshFailureCacheMs?: number;
   /**
+   * Timeout, in ms, for each individual `expiryStore` operation (`get`, `set`,
+   * `delete`). The expiry store is a supplementary cache, never the source of
+   * truth, so a slow or hung one must never be able to stall `tokens()` — which
+   * the transport calls on every single request — or delay the credential
+   * invalidation in `invalidateCredentials()`. On timeout mcp-auth-kit stops
+   * waiting and carries on as if the store had nothing to say: a `get` degrades
+   * to "expiry unknown", a `set`/`delete` is abandoned as best-effort. The
+   * underlying operation is not cancelled (an `ExpiryStore` has no cancellation
+   * contract); mcp-auth-kit simply stops awaiting it. Default: 5000.
+   */
+  storeTimeoutMs?: number;
+  /**
    * Called instead of `console.warn` for the (rare) conditions mcp-auth-kit
-   * needs to surface but must not throw on — currently only an `expiryStore`
-   * returning a non-finite value. Defaults to `console.warn`. Pass a no-op
-   * to silence, or route it into your own logger.
+   * needs to surface but must not throw on — an `expiryStore` returning a
+   * non-finite value, or an `expiryStore` operation exceeding
+   * `storeTimeoutMs`. Defaults to `console.warn`. Pass a no-op to silence, or
+   * route it into your own logger.
    */
   onWarning?: (message: string) => void;
 }
@@ -169,6 +182,7 @@ export function wrapOAuthClientProvider(
   const maxExpiresInSeconds = options.maxExpiresInSeconds ?? 30 * 24 * 60 * 60;
   const timeoutMs = options.timeoutMs ?? 30 * 1000;
   const refreshFailureCacheMs = options.refreshFailureCacheMs ?? 30 * 1000;
+  const storeTimeoutMs = options.storeTimeoutMs ?? 5 * 1000;
   const onWarning =
     options.onWarning ??
     ((message: string) => {
@@ -216,10 +230,34 @@ export function wrapOAuthClientProvider(
    * result over the cleared state once it resolves.
    */
   let expiryGeneration = 0;
-  /** In-flight refresh, so concurrent tokens() calls share one refresh request. */
-  let refreshing: Promise<OAuthTokens> | undefined;
+  /**
+   * MEDIO-2: why the current generation was started. A result computed under an
+   * older generation is always superseded, but the right response differs: if a
+   * newer `saveTokens()` supersedes it, valid tokens exist and last-write-wins
+   * is the correct answer; if an `invalidateCredentials()` does, the credentials
+   * are gone and there is nothing to hand back.
+   */
+  let generationReason: 'initial' | 'save' | 'invalidate' = 'initial';
+  /**
+   * ALTO-1: in-flight refresh, so concurrent tokens() calls share one request —
+   * but scoped to the generation it was started under. A caller from a NEWER
+   * generation must never inherit an older refresh's outcome: that older
+   * refresh is using a refresh_token that has since been replaced, and if it
+   * fails with `invalid_grant` the (now unwrapped, per FIX 2) error would reach
+   * the SDK's auth(), which responds by invalidating credentials — destroying
+   * the newer, valid tokens.
+   */
+  let refreshing: { generation: number; promise: Promise<OAuthTokens> } | undefined;
   /** Whether we've already warned about an invalid expiryStore value this process. */
   let warnedInvalidExpiryValue = false;
+  /** Whether we've already warned about an expiryStore operation timing out this process. */
+  let warnedStoreTimeout = false;
+  /**
+   * The in-flight `expiryStore.set()` from the most recent `saveTokens()`, so
+   * `invalidateCredentials()` can order its own store cleanup after it (see the
+   * FIFO note there).
+   */
+  let pendingStoreWrite: Promise<void> | undefined;
   /** Bajo-7: wall-clock ms until which refresh attempts are suppressed after a definitive failure. */
   let refreshBlockedUntil = 0;
   /** The sanitized cause of the definitive failure that opened the current suppression window. */
@@ -273,11 +311,53 @@ export function wrapOAuthClientProvider(
    * Starts a new generation, superseding anything computed under the previous
    * one. Called by the two paths that establish authoritative new state:
    * `saveTokens()` (we now hold accepted tokens) and `invalidateCredentials()`
-   * (the credentials are gone).
+   * (the credentials are gone). The reason is recorded so a superseded result
+   * can tell those two cases apart — see `generationReason`.
    */
-  function beginGeneration(): number {
+  function beginGeneration(reason: 'save' | 'invalidate'): number {
     expiryGeneration += 1;
+    generationReason = reason;
     return expiryGeneration;
+  }
+
+  /**
+   * MEDIO-3: runs one `expiryStore` operation with a bound on how long we wait,
+   * and swallows its errors. The store is a supplementary cache: it must never
+   * be able to stall `tokens()` (called on every request by the transport) or
+   * `invalidateCredentials()`. On timeout we stop awaiting and return
+   * `fallback`; the operation itself keeps running, since `ExpiryStore` has no
+   * cancellation contract.
+   */
+  async function runStoreOp<T>(
+    label: string,
+    op: () => Promise<T>,
+    fallback: T,
+  ): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = Symbol('store-timeout');
+    try {
+      const outcome = await Promise.race([
+        op().then(
+          (value) => value,
+          () => fallback, // a failing store degrades exactly like a missing one
+        ),
+        new Promise<typeof timedOut>((resolve) => {
+          timer = setTimeout(() => resolve(timedOut), storeTimeoutMs);
+        }),
+      ]);
+      if (outcome === timedOut) {
+        if (!warnedStoreTimeout) {
+          warnedStoreTimeout = true;
+          onWarning(
+            `[mcp-auth-kit] expiryStore.${label}("${sanitizeForMessage(resourceKey)}") exceeded storeTimeoutMs (${storeTimeoutMs}ms); continuing without it. The expiry store is a cache, never the source of truth.`,
+          );
+        }
+        return fallback;
+      }
+      return outcome;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   /**
@@ -404,14 +484,14 @@ export function wrapOAuthClientProvider(
     // Bajo-2: dedupe concurrent cold reads the same way refreshes are deduped.
     if (!expiryLoad) {
       const load = (async () => {
-        let raw: number | undefined;
-        try {
-          raw = await expiryStore.get(resourceKey);
-        } catch {
-          // A failing read is no worse than not having a store configured at
-          // all — degrade to the no-adapter default rather than blocking tokens().
-          return undefined;
-        }
+        // MEDIO-3: bounded. A failing OR hung read is no worse than not having a
+        // store configured at all — degrade to the no-adapter default rather
+        // than blocking tokens(), which the transport calls on every request.
+        const raw = await runStoreOp<number | undefined>(
+          'get',
+          () => expiryStore.get(resourceKey),
+          undefined,
+        );
         if (raw === undefined) return undefined;
 
         if (!isFiniteNumber(raw)) {
@@ -451,20 +531,52 @@ export function wrapOAuthClientProvider(
   }
 
   function refreshNow(stored: OAuthTokens): Promise<OAuthTokens> {
-    if (!refreshing) {
-      refreshing = performRefresh(stored).finally(() => {
-        refreshing = undefined;
-      });
+    // ALTO-1: only join an in-flight refresh from the SAME generation. One
+    // started under an older generation is refreshing a refresh_token that has
+    // since been replaced or revoked; inheriting its outcome would make this
+    // caller act on a result that does not describe the credentials it holds —
+    // and, when that outcome is an unwrapped `invalid_grant`, would have the
+    // SDK's auth() invalidate the newer, valid tokens in response.
+    if (refreshing && refreshing.generation === expiryGeneration) {
+      return refreshing.promise;
     }
-    return refreshing;
+    const generation = expiryGeneration;
+    let tracked: Promise<OAuthTokens>;
+    tracked = performRefresh(stored, generation).finally(() => {
+      // Only release the slot if it still holds THIS refresh.
+      if (refreshing?.promise === tracked) refreshing = undefined;
+    });
+    refreshing = { generation, promise: tracked };
+    return tracked;
   }
 
-  async function performRefresh(stored: OAuthTokens): Promise<OAuthTokens> {
-    // The generation this refresh belongs to. Everything it later writes is
-    // committed under this value, so a saveTokens() or invalidateCredentials()
-    // that lands while the request is in flight supersedes it.
-    const generation = expiryGeneration;
+  /**
+   * MEDIO-1 / MEDIO-2: the single place that decides what a refresh whose
+   * generation has been superseded should resolve to. Called from both the
+   * success and the failure path, so a stale refresh can never leak its outcome
+   * into the newer generation by either route.
+   *
+   * - Superseded by a newer `saveTokens()`: valid tokens exist. Hand those back
+   *   (last-write-wins, which is what an unwrapped provider would have done)
+   *   instead of failing a request that has a perfectly good answer.
+   * - Superseded by `invalidateCredentials()`: the credentials are gone. There
+   *   is nothing to hand back, so surface it.
+   */
+  async function resolveSupersededRefresh(): Promise<OAuthTokens> {
+    if (generationReason === 'save') {
+      const current = await provider.tokens();
+      if (current) return current;
+      // Tokens were saved and then removed out-of-band; fall through to the
+      // invalidated-shaped error rather than inventing a result.
+    }
+    throw new McpAuthKitError(
+      'token_refresh',
+      'The refresh was superseded while in flight: its credentials were invalidated or replaced before the response arrived, so the result was discarded',
+      'this is a benign race, not a failure of the refresh itself — retry the operation; the newer credentials, or the re-authorization the invalidation implies, take precedence',
+    );
+  }
 
+  async function performRefresh(stored: OAuthTokens, generation: number): Promise<OAuthTokens> {
     // Bajo-7: a refresh_token the authorization server has definitively
     // rejected (invalid_grant, etc.) will be rejected identically on every
     // subsequent call. Without this window, every tokens() call launches
@@ -526,16 +638,25 @@ export function wrapOAuthClientProvider(
         fetchFn,
       });
     } catch (error) {
-      // sanitizedCause mutates `error.message` in place and returns the very
-      // same object, so `error` itself is sanitized from here on — the
-      // unwrapped rethrow below is safe with respect to B11.
+      // sanitizedCause mutates `error.message` (and `errorUri`) in place and
+      // returns the very same object, so `error` itself is sanitized from here
+      // on — the unwrapped rethrow below is safe with respect to B11.
       const cause = sanitizedCause(error);
+
+      // MEDIO-1: check supersession BEFORE doing anything with this failure.
+      // A failure computed under an older generation describes credentials that
+      // have since been replaced or discarded, so it must neither open a
+      // suppression window over the newer state nor — critically — be rethrown
+      // unwrapped as one of the three classes auth() reacts to by invalidating
+      // credentials. Doing either would let a stale failure reach across
+      // generations, which is exactly the invariant this mechanism exists for.
+      if (generation !== expiryGeneration) {
+        return resolveSupersededRefresh();
+      }
+
       // Bajo-7: only DEFINITIVE failures open the suppression window.
       // Transient ones (network error, server_error, 429, our own timeout)
       // may well succeed on the next attempt and must stay retryable.
-      // Committed under this refresh's generation: a failure that belongs to
-      // credentials already invalidated (or superseded by a newer
-      // saveTokens()) must not open a window over the newer state.
       if (!isRetryableOAuthError(error)) {
         commitExpiryState(generation, {
           refreshFailure: { until: Date.now() + refreshFailureCacheMs, cause },
@@ -566,13 +687,9 @@ export function wrapOAuthClientProvider(
     // generation that no longer exists. Persisting them would resurrect
     // discarded credentials, overwrite the `expiresAt = 0` revocation sentinel
     // invalidateCredentials() wrote, and clear a failure window that belongs to
-    // the newer generation. Drop the result instead of committing it.
+    // the newer generation.
     if (generation !== expiryGeneration) {
-      throw new McpAuthKitError(
-        'token_refresh',
-        'The refresh completed but its credentials were invalidated or replaced while the request was in flight, so the result was discarded',
-        'this is a benign race, not a failure of the refresh itself — retry the operation; the newer credentials (or the re-authorization the invalidation implies) take precedence',
-      );
+      return resolveSupersededRefresh();
     }
 
     // B1: stamp `issuer` before persisting, same as the SDK's own auth()
@@ -602,7 +719,7 @@ export function wrapOAuthClientProvider(
     // expiryStore read, which would otherwise resolve later and overwrite this
     // fresh expiry with the persisted one). Bumping the generation first means
     // those stale results are dropped by commitExpiryState.
-    const generation = beginGeneration();
+    const generation = beginGeneration('save');
     const newExpiresAt = Date.now() + ttlMs;
     commitExpiryState(generation, {
       expiresAt: newExpiresAt,
@@ -615,14 +732,19 @@ export function wrapOAuthClientProvider(
     // current generation — otherwise we would write an expiry for credentials
     // that have since been invalidated, overwriting the revocation sentinel.
     if (expiryStore && generation === expiryGeneration) {
-      // M4: the wrapped provider's own save already succeeded above — an
-      // optional, supplementary expiry cache failing to write must not turn
-      // that success into a thrown error. Degrade to in-memory-only tracking
-      // for the rest of this process instead.
+      // M4 + MEDIO-3: the wrapped provider's own save already succeeded above —
+      // a supplementary expiry cache that fails, or hangs, must not turn that
+      // success into a thrown error or into an unbounded wait. Degrade to
+      // in-memory-only tracking for the rest of this process instead.
+      //
+      // The in-flight write is published so invalidateCredentials() can order
+      // its cleanup after it (see the FIFO note there).
+      const write = runStoreOp('set', () => expiryStore.set(resourceKey, newExpiresAt), undefined);
+      pendingStoreWrite = write;
       try {
-        await expiryStore.set(resourceKey, newExpiresAt);
-      } catch {
-        // best-effort; expiresAt is still tracked in memory for this instance.
+        await write;
+      } finally {
+        if (pendingStoreWrite === write) pendingStoreWrite = undefined;
       }
     }
   }
@@ -667,41 +789,58 @@ export function wrapOAuthClientProvider(
   }
   if (provider.invalidateCredentials) {
     wrapped.invalidateCredentials = async (scope) => {
-      if (scope === 'all' || scope === 'tokens') {
-        // Start a new generation FIRST: anything still in flight from the
-        // previous one (a cold store read, a refresh) now describes
-        // credentials that no longer exist, and commitExpiryState will drop
-        // whatever it tries to write.
-        const generation = beginGeneration();
-        commitExpiryState(generation, {
-          expiresAt: undefined,
-          // Force the next tokens() call to re-consult expiryStore rather than
-          // trusting a cached "nothing to check" from before the invalidation.
-          expiryStoreChecked: false,
-          // Bajo-7: the credentials that failed are being discarded, so the
-          // suppression window they opened no longer applies.
-          refreshFailure: null,
-        });
-        // Drop the shared in-flight read so the next one starts from scratch
-        // rather than reusing a promise issued for the old generation.
-        expiryLoad = undefined;
-        if (expiryStore) {
-          // M5: an un-deleted persisted expiry would otherwise outlive the
-          // credentials it described — remove it, or if the store can't
-          // delete, overwrite it with a sentinel that reads as "already
-          // expired" rather than leaving the stale (still-valid-looking) value.
-          try {
-            if (expiryStore.delete) {
-              await expiryStore.delete(resourceKey);
-            } else {
-              await expiryStore.set(resourceKey, 0);
-            }
-          } catch {
-            // best-effort cleanup; in-memory state is already cleared above.
-          }
-        }
+      if (scope !== 'all' && scope !== 'tokens') {
+        return provider.invalidateCredentials!(scope);
       }
-      return provider.invalidateCredentials!(scope);
+
+      // Start a new generation FIRST: anything still in flight from the
+      // previous one (a cold store read, a refresh) now describes credentials
+      // that no longer exist, and commitExpiryState will drop whatever it tries
+      // to write.
+      const generation = beginGeneration('invalidate');
+      commitExpiryState(generation, {
+        expiresAt: undefined,
+        // Force the next tokens() call to re-consult expiryStore rather than
+        // trusting a cached "nothing to check" from before the invalidation.
+        expiryStoreChecked: false,
+        // Bajo-7: the credentials that failed are being discarded, so the
+        // suppression window they opened no longer applies.
+        refreshFailure: null,
+      });
+      // Drop the shared in-flight read so the next one starts from scratch
+      // rather than reusing a promise issued for the old generation.
+      expiryLoad = undefined;
+
+      // MEDIO-3: revoke at the wrapped provider — the thing that actually holds
+      // the credentials — BEFORE touching the store. A slow or hung expiry cache
+      // must never be what stands between a revocation request and the tokens
+      // being gone, nor stall the SDK's auth() recovery, which awaits this call.
+      await provider.invalidateCredentials!(scope);
+
+      if (expiryStore) {
+        // Order this cleanup after any store write still in flight from a
+        // concurrent saveTokens() of this same instance. Without it, a slow
+        // `set` could land after the sentinel below and leave a live-looking
+        // expiry behind a revocation. Bounded by storeTimeoutMs, so a hung
+        // write cannot hold the cleanup hostage. This closes the ordering
+        // window within a process; two processes racing on one store is
+        // outside what an in-process wrapper can serialize (see README).
+        if (pendingStoreWrite) {
+          await pendingStoreWrite.catch(() => {});
+        }
+        // M5: an un-deleted persisted expiry would otherwise outlive the
+        // credentials it described — remove it, or if the store can't delete,
+        // overwrite it with a sentinel that reads as "already expired" rather
+        // than leaving the stale (still-valid-looking) value.
+        await runStoreOp(
+          expiryStore.delete ? 'delete' : 'set',
+          () =>
+            expiryStore.delete
+              ? expiryStore.delete(resourceKey)
+              : expiryStore.set(resourceKey, 0),
+          undefined,
+        );
+      }
     };
   }
   if (provider.prepareTokenRequest) {

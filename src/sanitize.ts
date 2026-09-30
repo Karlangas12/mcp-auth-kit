@@ -31,6 +31,19 @@ export function sanitizedCause(error: unknown): unknown {
       // Some exotic error subclass might have a read-only `message` — leave
       // it as-is rather than losing the typed error entirely.
     }
+    // BAJO-1: `error_uri` is the other server-controlled string the SDK carries
+    // on an OAuthError (`errorUri`, parsed from the token response as a free
+    // `z.string()`, not a validated URL). It matters more now than it used to:
+    // since recoverable OAuth errors are rethrown unwrapped, this object is the
+    // one that surfaces at the top level rather than sitting inside `.cause`.
+    const withUri = error as { errorUri?: unknown };
+    if (typeof withUri.errorUri === 'string') {
+      try {
+        withUri.errorUri = sanitizeForMessage(withUri.errorUri);
+      } catch {
+        // Read-only on some subclass — same reasoning as `message` above.
+      }
+    }
     return error;
   }
   return new Error(sanitizeForMessage(String(error)));

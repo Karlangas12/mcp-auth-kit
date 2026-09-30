@@ -76,17 +76,10 @@ interface and returns another one — same interface, same call sites — with:
    normalization: what this does and doesn't cover](#resource-normalization-what-this-does-and-doesnt-cover)
    below, it matters and the honest scope is narrower than "fixes the
    trailing-slash bug everywhere."
-5. **Typed, actionable errors — never silent failure.** Every failure mode
-   above throws `McpAuthKitError` with a `phase` (`token_refresh`,
-   `client_registration`, `resource_validation`, `authorization`) and a
-   concrete remediation string, instead of a bare "unauthorized." The
-   underlying error is preserved as `.cause` with its real type intact — you
-   can still do `err.cause instanceof InvalidGrantError` to tell "refresh
-   token revoked, re-authorize" apart from "transient failure, retry later" —
-   only its `.message` (the one field that can carry the authorization
-   server's own untrusted `error_description`) is stripped of control
-   characters, so a malicious authorization server can't forge log lines
-   through it.
+5. **Typed, actionable errors — never silent failure**, with one deliberate
+   exception that matters. See [Error contract](#error-contract) below: three
+   OAuth error classes are rethrown *unwrapped* so the SDK's own recovery
+   still works, and everything else is wrapped in `McpAuthKitError`.
 
 ## Install
 
@@ -213,6 +206,66 @@ configuration mismatch that a caller needs to fix. If you see duplicate client
 registrations, the thing to correct is the `authorizationServerUrl` you passed,
 not this behavior.
 
+## Error contract
+
+Most failures arrive as `McpAuthKitError`, with a `phase` (`token_refresh`,
+`client_registration`, `resource_validation`, `authorization`), a concrete
+remediation string, and the underlying error preserved as `.cause` with its
+real type intact.
+
+**Three OAuth error classes are the exception: they are rethrown unwrapped.**
+If a token refresh fails with `invalid_grant`, `invalid_client` or
+`unauthorized_client`, what you catch is the SDK's own `InvalidGrantError`,
+`InvalidClientError` or `UnauthorizedClientError` — not an `McpAuthKitError`,
+and `.cause` is `undefined`.
+
+That is not an oversight, it is load-bearing. The SDK's `auth()` matches
+exactly those three classes to recover: it calls `invalidateCredentials()` and
+retries into a re-authorization redirect. Because `auth()` calls
+`provider.tokens()` — this wrapper — *before* its own refresh logic, a refresh
+failure raised here is what `auth()` sees. Wrapping them would make its
+`instanceof` checks miss, and a revoked refresh token would become a hard error
+where the unwrapped SDK recovers on its own.
+
+So the classification to write against is:
+
+```ts
+import {
+  InvalidGrantError,
+  InvalidClientError,
+  UnauthorizedClientError,
+} from '@modelcontextprotocol/sdk/server/auth/errors.js';
+import { McpAuthKitError } from 'mcp-auth-kit';
+
+try {
+  const tokens = await authProvider.tokens();
+} catch (err) {
+  if (
+    err instanceof InvalidGrantError ||
+    err instanceof InvalidClientError ||
+    err instanceof UnauthorizedClientError
+  ) {
+    // Credentials are dead: re-authorize. If you are inside the SDK's auth(),
+    // it has already handled this for you.
+  } else if (err instanceof McpAuthKitError) {
+    // err.phase says which stage failed; err.remediation says what to do;
+    // err.cause carries the original error with its type intact.
+  }
+}
+```
+
+Two details worth knowing:
+
+- **Sanitization applies either way.** On the error that surfaces, both
+  `message` and `errorUri` — the two fields that can carry the authorization
+  server's own `error_description` / `error_uri` — are stripped of control
+  characters, so a hostile authorization server cannot forge log lines through
+  them.
+- **The failure cache preserves the type.** When a definitive failure is served
+  from the `refreshFailureCacheMs` window rather than re-attempted, a
+  recoverable class is still rethrown as itself. Downgrading it to a wrapper
+  there would silently re-break the recovery described above.
+
 ## Resource normalization: what this does and doesn't cover
 
 `normalizeResourceIndicator()` strips a trailing slash from a `resource`
@@ -276,13 +329,18 @@ implementations look like. If your provider implements
   non-idempotent POST and retrying one the server may already have applied
   creates a duplicate client.
 
-### Two options worth knowing about
+### Three options worth knowing about
 
-- **`onWarning`** — mcp-auth-kit emits exactly one kind of warning (an
-  `expiryStore` returning a non-finite value, which it then treats as
-  "unknown" rather than silently trusting). It goes to `console.warn` by
-  default; pass `onWarning` to route it into your own logger, or a no-op to
-  silence it. Nothing else in the package writes to the console.
+- **`onWarning`** — mcp-auth-kit emits warnings for exactly two conditions: an
+  `expiryStore` returning a non-finite value, and an `expiryStore` operation
+  exceeding `storeTimeoutMs`. Both are treated as "the store said nothing"
+  rather than silently trusted. Warnings go to `console.warn` by default; pass
+  `onWarning` to route them into your own logger, or a no-op to silence them.
+  Nothing else in the package writes to the console.
+- **`storeTimeoutMs`** (default 5000) — the bound on each individual
+  `expiryStore` operation. See [With `expiryStore` configured](#with-expirystore-configured);
+  the short version is that a hung cache must never stall `tokens()` or delay a
+  revocation.
 - **`refreshFailureCacheMs`** (default 30000) — after a refresh fails with a
   *definitive* error (`invalid_grant`: the refresh token is revoked or
   expired), further refresh attempts are short-circuited for this long
@@ -403,11 +461,54 @@ liability:
   either way, a revoked credential doesn't leave a stale, still-valid-looking
   expiry behind.
 
+- **Every store operation is bounded** by `storeTimeoutMs` (default 5000). The
+  store is a cache, never the source of truth, so it must never be able to
+  stall `tokens()` — which the transport calls on *every* request — or delay
+  `invalidateCredentials()`, which the SDK's `auth()` awaits during recovery.
+  On timeout mcp-auth-kit stops waiting and carries on as if the store had said
+  nothing, warning once through `onWarning`. The operation itself is not
+  cancelled: `ExpiryStore` has no cancellation contract, so mcp-auth-kit simply
+  stops awaiting it.
+- **Revocation reaches the wrapped provider first.** `invalidateCredentials()`
+  invalidates the wrapped provider — the thing that actually holds the
+  credentials — *before* touching the store, so a slow or hung expiry cache can
+  never be what stands between a revocation request and the tokens being gone.
+
 None of the above changes *where* credentials get sent — the store only ever
 influences *when* mcp-auth-kit decides to refresh, never *who* it refreshes
 against (that's what the issuer check above is for). A store an attacker can
 write to can, at worst, make refresh happen too early or too late; it cannot
 redirect a refresh_token or client_secret anywhere.
+
+#### Known limitation: write ordering across processes
+
+Store operations from *one* wrapper instance are ordered correctly:
+`invalidateCredentials()` waits for a store write still in flight from a
+concurrent `saveTokens()` before writing its own revocation sentinel (bounded by
+`storeTimeoutMs`), so a slow expiry write cannot land after the sentinel and
+leave a live-looking expiry behind a revocation.
+
+What an in-process wrapper cannot serialize is **two processes racing on one
+shared store**: if process A is mid-`saveTokens()` while process B revokes, A's
+expiry write may still land after B's sentinel. With a store whose operations
+complete out of issue order — anything network-backed, or concurrent file writes
+— that window is real rather than theoretical.
+
+Its practical impact is low, and it is worth being precise about why:
+
+- If the wrapped provider deletes its tokens on invalidation (what the SDK's
+  interface intends, and what `auth()`'s recovery relies on), the stale entry is
+  **inert**: `tokens()` only consults the expiry when there are stored tokens to
+  judge, so with the tokens gone the entry is never read.
+- If it does not, the worst case is a **delayed proactive refresh**, not a
+  security failure. The access token is still whatever the provider holds; the
+  SDK's reactive 401 path (see above) recovers on the next request, and the next
+  `saveTokens()` overwrites the entry.
+- The store never influences *where* credentials are sent, only *when* a refresh
+  is attempted, so this cannot redirect a token anywhere.
+
+If you want it fully closed, give the store serialized writes — a single writer,
+a queue, or one connection — and the ordering holds across processes too.
 
 ### Which to use
 
