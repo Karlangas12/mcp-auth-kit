@@ -11,6 +11,7 @@ import type {
 import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js';
 
 import {
+  isAbortError,
   isRetryableOAuthError,
   isRetryableRegistrationError,
   isSdkRecoverableOAuthError,
@@ -71,16 +72,33 @@ export interface McpAuthKitOptions {
    * client's behalf (registration, token refresh). A hung authorization
    * server must not be able to block the whole MCP client. Default: 30000.
    *
-   * Known limitation: the token refresh request is a non-idempotent POST.
-   * If the authorization server actually completes (and rotates) the
-   * refresh token before this timeout fires, but the response doesn't reach
-   * us in time, we abort having never seen the new refresh token — the next
-   * refresh attempt then fails with an invalid_grant-shaped error and forces
-   * a full re-login. This is not retried (retrying a possibly-already-applied
-   * mutation would reopen the double-registration risk M10 exists to avoid);
-   * raise `timeoutMs` if your authorization server is known to be slow.
+   * This bounds how long a CALLER waits. For the refresh grant specifically,
+   * the request is not aborted at this point — see `refreshSalvageMs`.
    */
   timeoutMs?: number;
+  /**
+   * How long, in ms, to keep a timed-out refresh request alive in the
+   * background in the hope of salvaging its result. Default: 120000. Set to 0
+   * to abort the refresh at `timeoutMs` instead (the pre-1.0.1 behaviour).
+   *
+   * The refresh grant is a NON-IDEMPOTENT POST against an authorization server
+   * that typically rotates the refresh token the moment it processes the
+   * request. Aborting at `timeoutMs` therefore destroys credentials: the server
+   * has already invalidated the old refresh token, and the response carrying
+   * the new one is thrown away with the connection. Every later attempt then
+   * fails with `invalid_grant` and the user is forced through a full re-login —
+   * for a refresh that actually succeeded.
+   *
+   * So the two concerns are separated. `timeoutMs` releases the caller, which
+   * is what keeps a hung authorization server from blocking the client. This
+   * window keeps the request itself open afterwards, and if it does land with
+   * tokens, they are persisted — under the same generation check every other
+   * late result goes through, so a response that arrives after the credentials
+   * it belongs to were replaced or invalidated is discarded rather than
+   * resurrected. The caller's own attempt still fails at `timeoutMs`; the
+   * salvage shows up as valid credentials on the next `tokens()` call.
+   */
+  refreshSalvageMs?: number;
   /**
    * When set, enables auto dynamic-client-registration-with-retry: if the
    * wrapped provider has no stored client information, mcp-auth-kit performs
@@ -199,6 +217,15 @@ export function wrapOAuthClientProvider(
         )
       : undefined;
   const fetchFn = withTimeout(options.fetchFn, timeoutMs);
+  const refreshSalvageMs = options.refreshSalvageMs ?? 120 * 1000;
+  // The refresh grant gets a longer HARD deadline than the caller's soft one,
+  // so a request that outlives `timeoutMs` stays alive long enough to be
+  // salvaged instead of being aborted mid-rotation. Still bounded: it is a
+  // deadline, not an absence of one.
+  const refreshFetchFn =
+    refreshSalvageMs > 0
+      ? withTimeout(options.fetchFn, Math.max(timeoutMs, refreshSalvageMs))
+      : fetchFn;
   const expiryStore = options.expiryStore;
   // M3: combine issuer + resource so two protected resources behind the
   // same authorization server don't share one expiry entry.
@@ -607,6 +634,72 @@ export function wrapOAuthClientProvider(
     );
   }
 
+  /**
+   * Runs the refresh grant with a SOFT timeout: the caller is released after
+   * `timeoutMs`, but the request is not aborted. If it lands afterwards with
+   * tokens, they are persisted rather than thrown away — the refresh grant
+   * rotates the refresh token server-side on receipt, so discarding a late
+   * success destroys the only credentials that still work.
+   *
+   * The late write goes through the same generation check as every other late
+   * result in this wrapper: a response belonging to credentials that have since
+   * been replaced or invalidated is dropped, never resurrected.
+   */
+  async function runRefreshWithSalvage(
+    run: () => Promise<OAuthTokens>,
+    generation: number,
+  ): Promise<OAuthTokens> {
+    if (refreshSalvageMs <= 0) return run();
+
+    const attempt = run();
+    const timedOut = Symbol('refresh-soft-timeout');
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      attempt.then(
+        (value) => ({ ok: true as const, value }),
+        (error: unknown) => ({ ok: false as const, error }),
+      ),
+      new Promise<typeof timedOut>((resolve) => {
+        timer = setTimeout(() => resolve(timedOut), timeoutMs);
+      }),
+    ]);
+    if (timer !== undefined) clearTimeout(timer);
+
+    if (outcome !== timedOut) {
+      if (outcome.ok) return outcome.value;
+      throw outcome.error;
+    }
+
+    // Soft timeout. Release the caller, keep the request.
+    void attempt.then(
+      async (late) => {
+        // The salvage may land long after the caller gave up, so it is exactly
+        // the kind of late writer rounds 4-7 exist to guard: only apply it if
+        // nothing authoritative has happened since this attempt started.
+        if (generation !== expiryGeneration) return;
+        try {
+          await saveTokens({ ...late, issuer: configuredIssuer });
+        } catch {
+          // Best effort: the caller already failed this attempt, and the
+          // wrapped provider's own storage error is its to surface.
+        }
+      },
+      () => {
+        // A late FAILURE has nothing to salvage. It also must not open the
+        // failure-cache window or be rethrown: it belongs to an attempt the
+        // caller has already been told failed.
+      },
+    );
+
+    const softTimeout = new Error(
+      `The refresh request did not answer within timeoutMs (${timeoutMs}ms)`,
+    );
+    // Named so the existing classification treats it exactly like any other
+    // abort: transient, never cached, never one of auth()'s recoverable classes.
+    softTimeout.name = 'AbortError';
+    throw softTimeout;
+  }
+
   async function performRefresh(stored: OAuthTokens, generation: number): Promise<OAuthTokens> {
     // Bajo-7: a refresh_token the authorization server has definitively
     // rejected (invalid_grant, etc.) will be rejected identically on every
@@ -661,13 +754,17 @@ export function wrapOAuthClientProvider(
 
     let refreshed: OAuthTokens;
     try {
-      refreshed = await refreshAuthorization(authorizationServerUrl, {
-        clientInformation: clientInfo,
-        refreshToken: stored.refresh_token as string,
-        resource,
-        addClientAuthentication: provider.addClientAuthentication,
-        fetchFn,
-      });
+      refreshed = await runRefreshWithSalvage(
+        () =>
+          refreshAuthorization(authorizationServerUrl, {
+            clientInformation: clientInfo,
+            refreshToken: stored.refresh_token as string,
+            resource,
+            addClientAuthentication: provider.addClientAuthentication,
+            fetchFn: refreshFetchFn,
+          }),
+        generation,
+      );
     } catch (error) {
       // sanitizedCause mutates `error.message` (and `errorUri`) in place and
       // returns the very same object, so `error` itself is sanitized from here
@@ -708,7 +805,12 @@ export function wrapOAuthClientProvider(
       throw new McpAuthKitError(
         'token_refresh',
         'Refreshing the access token via the refresh_token grant failed',
-        'the refresh_token may have been revoked or expired; discard stored tokens and re-run the authorization code flow',
+        isAbortError(error) && refreshSalvageMs > 0
+          ? // Telling the caller to discard tokens here would be actively
+            // wrong: the request may still be in flight, and if it lands with
+            // rotated credentials they are persisted. Retry rather than reset.
+            `the request did not answer in time and was not aborted — if it still lands with rotated credentials they will be persisted, so retry rather than discarding anything; raise timeoutMs if this authorization server is routinely this slow`
+          : 'the refresh_token may have been revoked or expired; discard stored tokens and re-run the authorization code flow',
         cause,
       );
     }

@@ -49,16 +49,18 @@ interface and returns another one — same interface, same call sites — with:
    timeout (`timeoutMs`, default 30s) so a hung authorization server can't
    block the client forever.
    >
-   > **Known limitation:** the refresh call is a non-idempotent POST. If the
-   > authorization server actually completes the refresh (and rotates the
-   > refresh token) but the response doesn't arrive before `timeoutMs`
-   > elapses, mcp-auth-kit aborts having never seen the new refresh token.
-   > The next refresh attempt then fails (the old refresh token is already
-   > invalidated server-side) and forces a full re-login. This is not
-   > retried — retrying a possibly-already-applied mutation would reopen the
-   > double-registration risk the registration-retry classification below
-   > exists to avoid. If your authorization server is known to be slow,
-   > raise `timeoutMs`.
+   > **The refresh grant is treated as the non-idempotent POST it is.** An
+   > authorization server usually rotates the refresh token the moment it
+   > processes the request, so aborting at `timeoutMs` would destroy
+   > credentials: the old token is already dead server-side and the response
+   > carrying the new one goes away with the connection. So `timeoutMs`
+   > releases the *caller*, and the request itself stays alive for up to
+   > `refreshSalvageMs` (default 2 min). If it lands with tokens they are
+   > persisted — under the same generation check as every other late result,
+   > so a response arriving after its credentials were replaced or revoked is
+   > discarded rather than resurrected. The caller's attempt still fails at
+   > `timeoutMs`; the salvage shows up on the next `tokens()` call. Set
+   > `refreshSalvageMs: 0` to abort at `timeoutMs` instead.
 3. **Retried dynamic client registration — only when it's worth retrying.**
    If the wrapped provider has no stored client information and you opt in
    via the `registration` option, mcp-auth-kit performs RFC 7591 dynamic
@@ -188,6 +190,46 @@ means:
 So: mcp-auth-kit only ever *narrows* behavior your provider already has
 (pre-normalizing a resource string, retrying a registration call), never
 *widens* it by pretending to support something it doesn't.
+
+### The issuer check fails open, and here is exactly when
+
+The check that refuses to send a refresh token or client credentials to the
+wrong authorization server compares the **stored `issuer` stamp** against the
+configured `authorizationServerUrl`. It can only do that when there is a stamp
+to compare. When `tokens.issuer` / `clientInformation.issuer` is absent, the
+check is **skipped and the refresh proceeds** — it fails open, not closed.
+
+**When that happens.** `issuer` is a client-side field: it is never part of an
+authorization server's token response. It exists only because something stamped
+it before storing. Two things do:
+
+- the SDK's own `auth()`, on everything it saves; and
+- mcp-auth-kit, on every token and client registration it persists itself.
+
+So in a session that has gone through either, the stamp is present and the
+check is live. It is absent when credentials were stored by something else:
+tokens written directly by application code, credentials persisted by an older
+SDK (`issuer` did not exist before 1.31.0), or a provider whose storage drops
+unknown fields on the way in or out — a `JSON.parse`/`pick` round trip that
+keeps only the fields it knows about will silently strip it.
+
+**Why it is not closed.** Failing closed would refuse to refresh any
+credential that predates the stamp, turning a storage detail into a forced
+re-login for existing users, including ones whose configuration is perfectly
+correct. The check exists to catch a *misconfiguration* — a wrapper pointed at
+one authorization server holding credentials issued by another — and an absent
+stamp is not evidence of that; it is an absence of evidence either way.
+
+**What it means for you.** The protection is real but conditional: it is a
+guard against reusing one wrapper across authorization servers, not a
+guarantee that credentials can never reach the wrong one. If you want it
+unconditional, make sure your provider stores what `saveTokens()` and
+`saveClientInformation()` hand it **unchanged** — the SDK warns on stdout when
+it sees unstamped tokens, which is a useful signal that your storage is
+dropping the field. Note also that each wrapper instance is configured with a
+single `authorizationServerUrl`; the mismatch this check guards against cannot
+arise at all if you use one wrapper per authorization server, which is the
+intended shape.
 
 ### A related, deliberate consequence: issuer mismatch causes re-registration
 
@@ -330,7 +372,7 @@ implementations look like. If your provider implements
   non-idempotent POST and retrying one the server may already have applied
   creates a duplicate client.
 
-### Three options worth knowing about
+### Four options worth knowing about
 
 - **`onWarning`** — mcp-auth-kit emits warnings for exactly two conditions: an
   `expiryStore` returning a non-finite value, and an `expiryStore` operation
@@ -350,6 +392,11 @@ implementations look like. If your provider implements
   mcp-auth-kit's own timeout — are never cached, since those may well
   succeed on the next attempt. The window is cleared by a successful
   `saveTokens()` or by `invalidateCredentials()`.
+- **`refreshSalvageMs`** (default 120000) — how long a timed-out refresh
+  request is kept alive in the background so a late response can still be
+  persisted, instead of aborting mid-rotation and destroying the credentials.
+  See the note under point 2 above. `0` disables salvage and aborts at
+  `timeoutMs`.
 
 ## Expiry persistence
 
