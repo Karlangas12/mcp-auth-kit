@@ -480,19 +480,30 @@ against (that's what the issuer check above is for). A store an attacker can
 write to can, at worst, make refresh happen too early or too late; it cannot
 redirect a refresh_token or client_secret anywhere.
 
-#### Known limitation: write ordering across processes
+#### Known limitation: write ordering
 
-Store operations from *one* wrapper instance are ordered correctly:
 `invalidateCredentials()` waits for a store write still in flight from a
-concurrent `saveTokens()` before writing its own revocation sentinel (bounded by
-`storeTimeoutMs`), so a slow expiry write cannot land after the sentinel and
-leave a live-looking expiry behind a revocation.
+concurrent `saveTokens()` of the same instance before writing its own revocation
+sentinel, so a slow expiry write does not land after the sentinel and leave a
+live-looking expiry behind a revocation.
 
-What an in-process wrapper cannot serialize is **two processes racing on one
-shared store**: if process A is mid-`saveTokens()` while process B revokes, A's
-expiry write may still land after B's sentinel. With a store whose operations
-complete out of issue order — anything network-backed, or concurrent file writes
-— that window is real rather than theoretical.
+That ordering holds **as long as the store answers within `storeTimeoutMs`**, and
+only then. The wait is bounded by that timeout — deliberately, so a hung store
+cannot hold a revocation hostage — which means it waits for mcp-auth-kit to
+*stop awaiting* the write, not for the store to actually apply it. If a write
+exceeds `storeTimeoutMs`, it is abandoned, the sentinel is written, and the
+abandoned write may still land afterwards and overwrite it. (`ExpiryStore` has no
+cancellation contract, so there is nothing to cancel.) Raising `storeTimeoutMs`
+above your store's realistic worst-case latency keeps this closed.
+
+The same applies, and cannot be closed in-process at all, to **two processes
+racing on one shared store**: if process A is mid-`saveTokens()` while process B
+revokes, A's expiry write may still land after B's sentinel. With a store whose
+operations complete out of issue order — anything network-backed, or concurrent
+file writes — both windows are real rather than theoretical.
+
+Either way the outcome is the same, and so is the reasoning below for why it is
+tolerable: a stale expiry entry, never a redirected credential.
 
 Its practical impact is low, and it is worth being precise about why:
 
@@ -508,7 +519,8 @@ Its practical impact is low, and it is worth being precise about why:
   is attempted, so this cannot redirect a token anywhere.
 
 If you want it fully closed, give the store serialized writes — a single writer,
-a queue, or one connection — and the ordering holds across processes too.
+a queue, or one connection — and set `storeTimeoutMs` above its realistic
+worst-case latency. Then the ordering holds across processes too.
 
 ### Which to use
 

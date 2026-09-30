@@ -337,10 +337,18 @@ export function wrapOAuthClientProvider(
     const timedOut = Symbol('store-timeout');
     try {
       const outcome = await Promise.race([
-        op().then(
-          (value) => value,
-          () => fallback, // a failing store degrades exactly like a missing one
-        ),
+        // MEDIO-2: `Promise.resolve().then(op)` rather than `op()` directly. A
+        // store that violates its own `Promise<...>` contract and throws
+        // synchronously would otherwise propagate straight out of here and break
+        // tokens() — the one function that exists so the store is never
+        // load-bearing. Deferring the call turns a synchronous throw into an
+        // ordinary rejection, absorbed by the same handler as an async one.
+        Promise.resolve()
+          .then(op)
+          .then(
+            (value) => value,
+            () => fallback, // a failing store degrades exactly like a missing one
+          ),
         new Promise<typeof timedOut>((resolve) => {
           timer = setTimeout(() => resolve(timedOut), storeTimeoutMs);
         }),
@@ -433,17 +441,34 @@ export function wrapOAuthClientProvider(
   }
 
   async function tokens(): Promise<OAuthTokens | undefined> {
+    // THE capture point for this operation. Read once, before the credentials
+    // it describes, and propagated by parameter from here on — never re-read
+    // mid-chain. `expiryGeneration` is only consulted afterwards to ask "is this
+    // still current?", never to re-label work already under way: a label taken
+    // later than the data it describes is how a refresh of a replaced
+    // refresh_token gets mistaken for a current one.
+    const generation = expiryGeneration;
     const stored = await provider.tokens();
     if (!stored) return undefined;
 
     if (expiresAt === undefined && !expiryStoreChecked) {
-      // Capture the generation before awaiting, then commit under it. If a
-      // saveTokens() landed or credentials were invalidated while this read
-      // was in flight, commitExpiryState drops the result instead of
-      // resurrecting a superseded expiry over newer state.
-      const generation = expiryGeneration;
+      // Committed under this operation's generation: if a saveTokens() landed
+      // or credentials were invalidated while the read was in flight,
+      // commitExpiryState drops the result instead of resurrecting a superseded
+      // expiry over newer state.
       const loaded = await loadExpiryFromStore();
       commitExpiryState(generation, { expiresAt: loaded, expiryStoreChecked: true });
+    }
+
+    if (generation !== expiryGeneration) {
+      // Authoritative state landed while we were reading. Both `stored` and the
+      // expiry just judged describe a superseded generation, so neither may be
+      // acted on: judging them would return a stale access token, and refreshing
+      // them would send a replaced refresh_token — whose rejection, being
+      // rethrown unwrapped for the SDK's benefit, would have auth() invalidate
+      // the newer credentials that superseded it. Hand back what is current
+      // instead (possibly nothing, if this was an invalidation).
+      return provider.tokens();
     }
 
     if (expiresAt === undefined) {
@@ -476,7 +501,7 @@ export function wrapOAuthClientProvider(
       );
     }
 
-    return refreshNow(stored);
+    return refreshNow(stored, generation);
   }
 
   function loadExpiryFromStore(): Promise<number | undefined> {
@@ -530,17 +555,23 @@ export function wrapOAuthClientProvider(
     return expiryLoad;
   }
 
-  function refreshNow(stored: OAuthTokens): Promise<OAuthTokens> {
-    // ALTO-1: only join an in-flight refresh from the SAME generation. One
-    // started under an older generation is refreshing a refresh_token that has
-    // since been replaced or revoked; inheriting its outcome would make this
-    // caller act on a result that does not describe the credentials it holds —
-    // and, when that outcome is an unwrapped `invalid_grant`, would have the
-    // SDK's auth() invalidate the newer, valid tokens in response.
-    if (refreshing && refreshing.generation === expiryGeneration) {
+  /**
+   * ALTO-1: only join an in-flight refresh from the SAME generation. One started
+   * under an older generation is refreshing a refresh_token that has since been
+   * replaced or revoked; inheriting its outcome would make this caller act on a
+   * result that does not describe the credentials it holds — and, when that
+   * outcome is an unwrapped `invalid_grant`, would have the SDK's auth()
+   * invalidate the newer, valid tokens in response.
+   *
+   * `generation` is the caller's, captured alongside `stored` — it is NOT
+   * re-read here. Re-reading would label this refresh with whatever generation
+   * happens to be current at the moment the request starts, rather than the one
+   * the `refresh_token` in `stored` actually belongs to.
+   */
+  function refreshNow(stored: OAuthTokens, generation: number): Promise<OAuthTokens> {
+    if (refreshing && refreshing.generation === generation) {
       return refreshing.promise;
     }
-    const generation = expiryGeneration;
     let tracked: Promise<OAuthTokens>;
     tracked = performRefresh(stored, generation).finally(() => {
       // Only release the slot if it still holds THIS refresh.
@@ -815,6 +846,13 @@ export function wrapOAuthClientProvider(
       // the credentials — BEFORE touching the store. A slow or hung expiry cache
       // must never be what stands between a revocation request and the tokens
       // being gone, nor stall the SDK's auth() recovery, which awaits this call.
+      //
+      // If this throws, the store cleanup below is skipped and a persisted
+      // expiry can outlive this call. That is deliberate and coherent, not a
+      // gap: the throw means the credentials were NOT revoked, so they are still
+      // there, and the expiry that describes them is still the right answer for
+      // them. The caller sees the failure and can retry. Writing the revocation
+      // sentinel here instead would claim a revocation that did not happen.
       await provider.invalidateCredentials!(scope);
 
       if (expiryStore) {
