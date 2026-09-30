@@ -84,7 +84,7 @@ interface and returns another one — same interface, same call sites — with:
 ## Install
 
 ```bash
-npm install mcp-auth-kit @modelcontextprotocol/sdk
+npm install @karlangas12/mcp-auth-kit @modelcontextprotocol/sdk
 ```
 
 `@modelcontextprotocol/sdk` is a peer dependency — see
@@ -139,7 +139,7 @@ noted in `src/issuerMatch.ts` together.
 ## Usage
 
 ```ts
-import { wrapOAuthClientProvider } from 'mcp-auth-kit';
+import { wrapOAuthClientProvider } from '@karlangas12/mcp-auth-kit';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
@@ -236,7 +236,7 @@ import {
   InvalidClientError,
   UnauthorizedClientError,
 } from '@modelcontextprotocol/sdk/server/auth/errors.js';
-import { McpAuthKitError } from 'mcp-auth-kit';
+import { McpAuthKitError } from '@karlangas12/mcp-auth-kit';
 
 try {
   const tokens = await authProvider.tokens();
@@ -403,7 +403,7 @@ Pass an `ExpiryStore` — two methods, owned by mcp-auth-kit, not part of
 `OAuthClientProvider` — to persist `expiresAt` across restarts:
 
 ```ts
-import type { ExpiryStore } from 'mcp-auth-kit';
+import type { ExpiryStore } from '@karlangas12/mcp-auth-kit';
 
 const expiryStore: ExpiryStore = {
   async get(resourceKey) {

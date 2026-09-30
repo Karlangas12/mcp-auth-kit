@@ -1,5 +1,5 @@
 {
-  "name": "mcp-auth-kit",
+  "name": "@karlangas12/mcp-auth-kit",
   "version": "1.0.0",
   "type": "module",
   "description": "Drop-in OAuthClientProvider wrapper for @modelcontextprotocol/sdk that fixes proactive token refresh, dynamic client registration retry, and trailing-slash resource normalization bugs seen across real MCP clients.",
