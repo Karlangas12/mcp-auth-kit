@@ -1,10 +1,18 @@
 {
   "name": "mcp-auth-kit",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "type": "module",
   "description": "Drop-in OAuthClientProvider wrapper for @modelcontextprotocol/sdk that fixes proactive token refresh, dynamic client registration retry, and trailing-slash resource normalization bugs seen across real MCP clients.",
   "license": "MIT",
-  "author": "Carlos",
+  "author": "Carlos (Then Apply)",
+  "homepage": "https://github.com/Karlangas12/mcp-auth-kit#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Karlangas12/mcp-auth-kit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Karlangas12/mcp-auth-kit/issues"
+  },
   "keywords": [
     "mcp",
     "model-context-protocol",

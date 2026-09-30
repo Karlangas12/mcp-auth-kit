@@ -87,7 +87,8 @@ interface and returns another one — same interface, same call sites — with:
 npm install mcp-auth-kit @modelcontextprotocol/sdk
 ```
 
-(Not yet published — see [Status](#status) below.)
+`@modelcontextprotocol/sdk` is a peer dependency — see
+[Supported versions](#supported-modelcontextprotocolsdk-versions) below.
 
 ### Supported `@modelcontextprotocol/sdk` versions
 
@@ -548,10 +549,27 @@ npm test
 
 ## Status
 
-MVP. Standalone package, zero dependency on any other product — works with
-any `@modelcontextprotocol/sdk` client, whether or not you use anything else
-from this author. Not yet published to npm or made public; that's a decision
-still pending.
+Standalone and dependency-free at runtime: `@modelcontextprotocol/sdk` is the
+only peer dependency, and mcp-auth-kit works with any client built on it.
+
+Every fix in the table above came out of a real, open, unresolved issue, and
+each one is pinned by a test that first reproduces the failure against an
+unwrapped provider. Several tests drive the SDK's real `auth()` orchestrator
+rather than a mock, because the bugs that mattered most only appeared through
+its own control flow. The commit history is deliberately unsquashed: the
+package went through seven rounds of adversarial security review, and each
+round's findings and fixes are traceable in it.
+
+Three of those tests are **drift guards** rather than feature tests, and they
+are the ones to watch when bumping `@modelcontextprotocol/sdk`:
+
+- `tests/issuer-match.test.ts` — `src/issuerMatch.ts` replicates a private,
+  non-exported SDK function. The test extracts the real one from the installed
+  SDK and differentially fuzzes it against the copy.
+- `tests/sdk-recovery.test.ts` — asserts which error classes `auth()` actually
+  branches on, since the unwrapped-rethrow behaviour mirrors that set.
+- `tests/package-manifest.test.ts` — pins the declared peer floor against the
+  features it exists for.
 
 ## License
 
