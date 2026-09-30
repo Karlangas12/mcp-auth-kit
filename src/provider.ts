@@ -78,8 +78,18 @@ export interface McpAuthKitOptions {
   timeoutMs?: number;
   /**
    * How long, in ms, to keep a timed-out refresh request alive in the
-   * background in the hope of salvaging its result. Default: 120000. Set to 0
-   * to abort the refresh at `timeoutMs` instead (the pre-1.0.1 behaviour).
+   * background in the hope of salvaging its result. **Default: 0 — salvage is
+   * off, and the refresh is aborted at `timeoutMs`.** Set it to a positive
+   * value to opt in.
+   *
+   * Off by default because keeping a request alive has costs that fall hardest
+   * on this package's main audience, short-lived CLI-style MCP clients: the
+   * in-flight request is a live socket the process may wait on, and the window
+   * widens the period in which a second attempt can resend the same
+   * `refresh_token` — which a strict authorization server may treat as token
+   * reuse and answer by revoking the whole family. Turn it on if your
+   * authorization server is slow enough that refreshes genuinely time out, and
+   * you would rather pay those costs than lose a rotated token.
    *
    * The refresh grant is a NON-IDEMPOTENT POST against an authorization server
    * that typically rotates the refresh token the moment it processes the
@@ -217,7 +227,7 @@ export function wrapOAuthClientProvider(
         )
       : undefined;
   const fetchFn = withTimeout(options.fetchFn, timeoutMs);
-  const refreshSalvageMs = options.refreshSalvageMs ?? 120 * 1000;
+  const refreshSalvageMs = options.refreshSalvageMs ?? 0;
   // The refresh grant gets a longer HARD deadline than the caller's soft one,
   // so a request that outlives `timeoutMs` stays alive long enough to be
   // salvaged instead of being aborted mid-rotation. Still bounded: it is a
@@ -341,6 +351,31 @@ export function wrapOAuthClientProvider(
    * (the credentials are gone). The reason is recorded so a superseded result
    * can tell those two cases apart — see `generationReason`.
    */
+  /**
+   * ALTO-1: serializes this wrapper's own mutations of the wrapped provider's
+   * credential storage, so a `saveTokens()` and an `invalidateCredentials()`
+   * that overlap are applied in call order rather than in I/O-completion order.
+   *
+   * Detecting the overlap afterwards is not enough on its own. By the time a
+   * generation re-check can see that credentials were invalidated mid-write,
+   * `provider.saveTokens()` has already written them back — the revoked tokens
+   * are in storage and no later check can un-write them. The only way to keep
+   * a revocation is to not let the write land after it.
+   *
+   * Both callers are non-reentrant (neither saves from inside an invalidation
+   * nor the reverse), so this cannot deadlock. It bounds nothing: the queue
+   * only ever waits on the wrapped provider's own storage.
+   */
+  let credentialMutations: Promise<unknown> = Promise.resolve();
+  function serializeCredentialMutation<T>(run: () => Promise<T> | T): Promise<T> {
+    const next = credentialMutations.then(run, run);
+    credentialMutations = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
   function beginGeneration(reason: 'save' | 'invalidate'): number {
     expiryGeneration += 1;
     generationReason = reason;
@@ -377,6 +412,11 @@ export function wrapOAuthClientProvider(
             () => fallback, // a failing store degrades exactly like a missing one
           ),
         new Promise<typeof timedOut>((resolve) => {
+          // ALTO-2: deliberately NOT unref'd. This timer is not a safety net
+          // standing behind other work — it is the thing that resolves this
+          // race and lets tokens() proceed. Unref it and a process whose only
+          // pending work is a hung store would exit before it fired, leaving
+          // the caller's promise unsettled instead of degrading gracefully.
           timer = setTimeout(() => resolve(timedOut), storeTimeoutMs);
         }),
       ]);
@@ -660,6 +700,10 @@ export function wrapOAuthClientProvider(
         (error: unknown) => ({ ok: false as const, error }),
       ),
       new Promise<typeof timedOut>((resolve) => {
+        // ALTO-2: deliberately NOT unref'd, for the same reason as the store
+        // race above — this timer delivers the caller's answer. What must not
+        // hold the process is the long salvage deadline inside the fetch
+        // wrapper, and that one IS unref'd.
         timer = setTimeout(() => resolve(timedOut), timeoutMs);
       }),
     ]);
@@ -842,7 +886,19 @@ export function wrapOAuthClientProvider(
     // error and leave `expiresAt` untouched rather than believing a token
     // was saved when it wasn't (which would silently serve a stale token
     // forever afterward).
-    await provider.saveTokens(newTokens);
+    // ALTO-1: the generation this save belongs to, captured before the write.
+    const generationAtEntry = expiryGeneration;
+    // Ordered against any concurrent invalidateCredentials(), so a revocation
+    // called after this save cannot be overtaken by this save's storage write.
+    await serializeCredentialMutation(() => provider.saveTokens(newTokens));
+    // ALTO-1: re-check AFTER the write resolves, not only before it started.
+    // `provider.saveTokens` is real I/O — disk, keychain, network — and an
+    // `invalidateCredentials()` landing during it clears the state and writes
+    // the revocation sentinel. Committing afterwards would put an expiry back
+    // over a revocation and overwrite that sentinel in the store. Every caller
+    // of this function checks the generation before calling it; that check
+    // alone cannot see what happens during the await.
+    if (generationAtEntry !== expiryGeneration) return;
     const ttlMs =
       newTokens.expires_in !== undefined
         ? clampServerExpiresInSeconds(newTokens.expires_in) * 1000
@@ -955,7 +1011,10 @@ export function wrapOAuthClientProvider(
       // there, and the expiry that describes them is still the right answer for
       // them. The caller sees the failure and can retry. Writing the revocation
       // sentinel here instead would claim a revocation that did not happen.
-      await provider.invalidateCredentials!(scope);
+      // ALTO-1: ordered against any in-flight saveTokens() of this wrapper, so
+      // a save that started before this call cannot land after it and put the
+      // revoked credentials back into storage.
+      await serializeCredentialMutation(() => provider.invalidateCredentials!(scope));
 
       if (expiryStore) {
         // Order this cleanup after any store write still in flight from a

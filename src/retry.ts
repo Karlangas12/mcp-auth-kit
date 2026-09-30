@@ -23,6 +23,15 @@ export interface BackoffOptions {
   random?: () => number;
 }
 
+/**
+ * Deliberately NOT `unref()`'d, unlike the deadline timers elsewhere in this
+ * package. Those are safety nets, where firing is the exceptional path, so they
+ * must not be a reason for a short-lived process to stay alive. This one is the
+ * opposite: the delay *is* the work the caller is awaiting. A pending promise
+ * does not hold the Node event loop, so this timer is the only thing keeping
+ * the process alive between retry attempts — unref it and a process waiting on
+ * `clientInformation()` would exit silently mid-backoff.
+ */
 const defaultSleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 

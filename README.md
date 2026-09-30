@@ -54,13 +54,21 @@ interface and returns another one — same interface, same call sites — with:
    > processes the request, so aborting at `timeoutMs` would destroy
    > credentials: the old token is already dead server-side and the response
    > carrying the new one goes away with the connection. So `timeoutMs`
-   > releases the *caller*, and the request itself stays alive for up to
-   > `refreshSalvageMs` (default 2 min). If it lands with tokens they are
-   > persisted — under the same generation check as every other late result,
-   > so a response arriving after its credentials were replaced or revoked is
-   > discarded rather than resurrected. The caller's attempt still fails at
-   > `timeoutMs`; the salvage shows up on the next `tokens()` call. Set
-   > `refreshSalvageMs: 0` to abort at `timeoutMs` instead.
+   > releases the *caller*, and — **if you opt in by setting
+   > `refreshSalvageMs`** — the request itself stays alive for up to that
+   > long. If it lands with tokens they are persisted, under the same
+   > generation check as every other late result, so a response arriving
+   > after its credentials were replaced or revoked is discarded rather than
+   > resurrected. The caller's attempt still fails at `timeoutMs`; the
+   > salvage shows up on the next `tokens()` call.
+   >
+   > The salvage is **off by default** (`refreshSalvageMs: 0`) because it
+   > only pays off for a process that outlives the window. Most MCP clients
+   > are short-lived: the process exits before the salvage can land, so all
+   > the window buys is a longer period during which an already-rotated
+   > refresh token is in flight. Turn it on for a long-running client — a
+   > daemon, a server, an editor extension — where the next `tokens()` call
+   > is minutes away and the salvage has somewhere to arrive.
 3. **Retried dynamic client registration — only when it's worth retrying.**
    If the wrapped provider has no stored client information and you opt in
    via the `registration` option, mcp-auth-kit performs RFC 7591 dynamic
@@ -392,11 +400,31 @@ implementations look like. If your provider implements
   mcp-auth-kit's own timeout — are never cached, since those may well
   succeed on the next attempt. The window is cleared by a successful
   `saveTokens()` or by `invalidateCredentials()`.
-- **`refreshSalvageMs`** (default 120000) — how long a timed-out refresh
-  request is kept alive in the background so a late response can still be
-  persisted, instead of aborting mid-rotation and destroying the credentials.
-  See the note under point 2 above. `0` disables salvage and aborts at
-  `timeoutMs`.
+- **`refreshSalvageMs`** (default `0`, i.e. off) — how long a timed-out
+  refresh request is kept alive in the background so a late response can
+  still be persisted, instead of aborting mid-rotation and destroying the
+  credentials. See the note under point 2 above for when it's worth turning
+  on. At `0`, a refresh aborts at `timeoutMs`.
+
+## A note on timers and process lifetime
+
+The package is used mostly by short-lived processes, so it is careful about
+what it lets keep the Node event loop alive. The deadline timer behind every
+HTTP call (`timeoutMs`) is `unref()`'d: it still fires whenever the process
+is otherwise running, but it never by itself becomes the reason a process
+hasn't exited. The two timers that *are* the caller's answer rather than a
+safety net — the registration/refresh backoff delay, and the soft `timeoutMs`
+that releases a caller waiting on a salvaged refresh — are deliberately left
+ref'd, since unref'ing them would let a process exit mid-wait and leave the
+caller's promise forever unsettled.
+
+What this does **not** control is anything below the wrapper. An abort tells
+your `fetchFn` to give up; whether it actually closes the socket, and whether
+that socket's handle was holding the loop open, belongs to the fetch
+implementation and its agent. If a process still won't exit with a request in
+flight, check there — a keep-alive agent with a pooled connection is the
+usual answer, and `agent.destroy()` or an explicit `unref` on your HTTP agent
+is the usual fix.
 
 ## Expiry persistence
 

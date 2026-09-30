@@ -37,6 +37,12 @@ export function withTimeout(fetchFn: FetchLike | undefined, timeoutMs: number): 
       controller.abort();
       cleanup();
     }, timeoutMs);
+    // ALTO-2: a deadline is a safety net, not work the process owes anyone. An
+    // un-unref'd timer keeps the Node event loop alive, so a short-lived
+    // client — which is what most MCP clients are — could not exit until it
+    // elapsed. Unref'd, it still fires while the process is otherwise busy,
+    // and stops being a reason to stay alive when it isn't.
+    timer.unref?.();
 
     if (callerSignal) {
       if (callerSignal.aborted) {

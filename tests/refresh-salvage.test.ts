@@ -135,6 +135,9 @@ describe('M6: a refresh that answers after timeoutMs is salvaged, not destroyed'
       authorizationServerUrl: AS,
       fetchFn: fetchFn as unknown as typeof fetch,
       timeoutMs: 40,
+      // Salvage is opt-in as of 1.0.1, and this message only applies when it
+      // is on — with it off, "discard and re-authorize" is the right advice.
+      refreshSalvageMs: 5_000,
       minExpiresInSeconds: 1,
       refreshMarginMs: 0,
     });
