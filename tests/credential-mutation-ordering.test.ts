@@ -252,3 +252,39 @@ describe('1.0.1: salvage is opt-in', () => {
     expect((peek() as { refresh_token?: string })?.refresh_token).toBe('old-rt');
   });
 });
+
+describe('the mutation queue is per-instance, not global', () => {
+  it('a wedged provider does not block credential writes on another instance', async () => {
+    // The queue is a closure variable, so each wrapper owns one. Hoisting it to
+    // module scope would make one hung keychain stall every other server's
+    // credentials in the same process — this test is what catches that.
+    let releaseWedged: () => void = () => {};
+    const wedged = slowStorageProvider(0);
+    wedged.provider.saveTokens = () => new Promise<void>((r) => (releaseWedged = () => r()));
+
+    const healthy = slowStorageProvider(0);
+
+    const a = wrapOAuthClientProvider(wedged.provider as never, {
+      authorizationServerUrl: AS,
+      refreshSalvageMs: 0,
+    });
+    const b = wrapOAuthClientProvider(healthy.provider as never, {
+      authorizationServerUrl: AS,
+      refreshSalvageMs: 0,
+    });
+
+    const tokens = { token_type: 'Bearer', refresh_token: 'r', expires_in: 3600 } as const;
+    let aSettled = false;
+    void a.saveTokens({ access_token: 'wedged', ...tokens }).then(() => (aSettled = true));
+    await sleep(20);
+
+    // B must not be waiting on A's hung storage.
+    await b.saveTokens({ access_token: 'healthy', ...tokens });
+    expect((healthy.peek() as { access_token?: string })?.access_token).toBe('healthy');
+    expect(aSettled).toBe(false);
+
+    releaseWedged();
+    await sleep(20);
+    expect(aSettled).toBe(true);
+  });
+});
