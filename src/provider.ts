@@ -91,10 +91,13 @@ export interface McpAuthKitOptions {
    * - A revoked credential's request stayed in flight for the rest of the
    *   window. `invalidateCredentials()` now aborts it (MEDIO-1).
    *
-   * What remains is the cost that cannot be closed from inside this package: a
+   * What remains is the cost that cannot be closed from inside this package. A
    * short-lived process may exit before the salvage lands, in which case the
-   * window bought nothing. It also costs nothing there — the deadline timer is
-   * unref'd, so it is never itself a reason for a process to stay alive.
+   * window bought nothing. The deadline timer is unref'd, so it is never itself
+   * a reason to stay alive — but the in-flight request's SOCKET belongs to the
+   * `fetchFn` and its agent, and if that handle holds the event loop, the
+   * process can be kept alive until the request ends. Set this to `0` if you
+   * would rather a short-lived client always exit promptly.
    *
    * The refresh grant is a NON-IDEMPOTENT POST against an authorization server
    * that typically rotates the refresh token the moment it processes the
@@ -320,16 +323,75 @@ export function wrapOAuthClientProvider(
     pendingSalvage = undefined;
     salvage?.abort();
   }
+
+  /**
+   * MEDIO-1: the cancel handle for a refresh request that is in flight RIGHT
+   * NOW, published the moment the request starts rather than when it becomes a
+   * salvage.
+   *
+   * Registering only at the soft timeout left the whole pre-timeout window —
+   * `timeoutMs`, 30s by default, and the common case rather than an edge one —
+   * with no handle for a revocation to reach, so a logout during it left the
+   * user's `refresh_token` on the wire for the rest of the salvage window. The
+   * slot exists for the request's whole life; `pendingSalvage` continues to
+   * carry it afterwards for the join (MEDIO-2), which is a different question.
+   */
+  let inFlightRefresh: { generation: number; abort: () => void } | undefined;
+
+  /**
+   * MEDIO-1: cancel every outstanding refresh request of this instance,
+   * whichever phase it is in. Called when credentials are revoked: there is
+   * nothing left for any of them to refresh.
+   */
+  function abortInFlightRefreshes(): void {
+    const active = inFlightRefresh;
+    inFlightRefresh = undefined;
+    active?.abort();
+    abortPendingSalvage();
+  }
   /** Whether we've already warned about an invalid expiryStore value this process. */
   let warnedInvalidExpiryValue = false;
   /** Whether we've already warned about an expiryStore operation timing out this process. */
   let warnedStoreTimeout = false;
   /**
-   * The in-flight `expiryStore.set()` from the most recent `saveTokens()`, so
-   * `invalidateCredentials()` can order its own store cleanup after it (see the
-   * FIFO note there).
+   * BAJO-1: expiry-store writes are ordered against each other, and ALL of the
+   * outstanding ones are tracked — not just the most recent.
+   *
+   * Two defects came from doing neither. A store write is issued after its
+   * save has already released its queue turn, so two saves' writes raced: a
+   * store whose latency varies with the value (a file, a keychain, a network
+   * cache — i.e. a real one) could land the earlier save's expiry last, leaving
+   * the persisted copy describing tokens that are no longer there. That is the
+   * same failure BAJO-D fixed in memory, surviving in the persisted copy. And
+   * tracking only the newest write meant a revocation awaited the wrong one, so
+   * an older straggler could restore a live-looking expiry after the delete
+   * that M5 exists to guarantee.
+   *
+   * This queue is separate from the credential-mutation queue on purpose: the
+   * expiry store is a supplementary cache, and coupling credential writes to
+   * its latency is exactly what `storeTimeoutMs` exists to prevent. Every
+   * operation on it is individually bounded by that timeout, so the queue
+   * cannot be held open indefinitely.
    */
-  let pendingStoreWrite: Promise<void> | undefined;
+  let storeWrites: Promise<unknown> = Promise.resolve();
+  const outstandingStoreWrites = new Set<Promise<void>>();
+
+  function queueStoreWrite(run: () => Promise<void>): Promise<void> {
+    const next = storeWrites.then(run, run);
+    storeWrites = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    // Tracked in its settled-and-neutralized form, so awaiting the set never
+    // resurfaces an error the originating caller already handled.
+    const tracked = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    outstandingStoreWrites.add(tracked);
+    void tracked.then(() => outstandingStoreWrites.delete(tracked));
+    return next;
+  }
   /** Bajo-7: wall-clock ms until which refresh attempts are suppressed after a definitive failure. */
   let refreshBlockedUntil = 0;
   /** The sanitized cause of the definitive failure that opened the current suppression window. */
@@ -981,6 +1043,11 @@ export function wrapOAuthClientProvider(
     // with the salvage deadline instead of replacing it.
     const salvageAbort = new AbortController();
 
+    // MEDIO-1: published BEFORE the request goes out, so a revocation arriving
+    // at any point in its life can cancel it.
+    const registration = { generation, abort: () => salvageAbort.abort() };
+    inFlightRefresh = registration;
+
     let refreshed: OAuthTokens;
     try {
       refreshed = await runRefreshWithSalvage(
@@ -1054,6 +1121,12 @@ export function wrapOAuthClientProvider(
           : 'the refresh_token may have been revoked or expired; discard stored tokens and re-run the authorization code flow',
         cause,
       );
+    } finally {
+      // Release the slot only if it still holds THIS request — the same
+      // identity discipline as the `refreshing` and `pendingSalvage` slots. A
+      // salvage that outlives this frame keeps its own handle in
+      // `pendingSalvage`, so cancellation stays reachable without this one.
+      if (inFlightRefresh === registration) inFlightRefresh = undefined;
     }
 
     // If credentials were invalidated (or superseded by a newer saveTokens())
@@ -1143,15 +1216,12 @@ export function wrapOAuthClientProvider(
       // success into a thrown error or into an unbounded wait. Degrade to
       // in-memory-only tracking for the rest of this process instead.
       //
-      // The in-flight write is published so invalidateCredentials() can order
-      // its cleanup after it (see the FIFO note there).
-      const write = runStoreOp('set', () => expiryStore.set(resourceKey, newExpiresAt), undefined);
-      pendingStoreWrite = write;
-      try {
-        await write;
-      } finally {
-        if (pendingStoreWrite === write) pendingStoreWrite = undefined;
-      }
+      // BAJO-1: ordered against this instance's other store writes, and
+      // tracked so invalidateCredentials() can wait for all of them rather
+      // than only the newest.
+      await queueStoreWrite(() =>
+        runStoreOp('set', () => expiryStore.set(resourceKey, newExpiresAt), undefined),
+      );
     }
   }
 
@@ -1230,12 +1300,14 @@ export function wrapOAuthClientProvider(
         // Drop the shared in-flight read so the next one starts from scratch
         // rather than reusing a promise issued for the old generation.
         expiryLoad = undefined;
-        // MEDIO-1: a salvage still waiting on a refresh response belongs to
-        // credentials that no longer exist. Its write would be discarded by the
-        // generation check anyway, but leaving the request in flight keeps a
-        // rotated refresh_token moving on a connection the user just asked to
-        // tear down, and holds the socket for the rest of the salvage window.
-        abortPendingSalvage();
+        // MEDIO-1: a refresh still waiting on a response belongs to credentials
+        // that no longer exist. Its write would be discarded by the generation
+        // check anyway, but leaving the request in flight keeps a rotated
+        // refresh_token moving on a connection the user just asked to tear
+        // down, and holds the socket until the request's own deadline. This
+        // covers the request in every phase, not only once it has become a
+        // salvage — the pre-timeout window is the common case.
+        abortInFlightRefreshes();
       }
 
       // MEDIO-B: revoke at the wrapped provider IMMEDIATELY, never from behind
@@ -1283,27 +1355,32 @@ export function wrapOAuthClientProvider(
       if (!tracked) return;
 
       if (expiryStore) {
-        // Order this cleanup after any store write still in flight from a
-        // concurrent saveTokens() of this same instance. Without it, a slow
-        // `set` could land after the sentinel below and leave a live-looking
-        // expiry behind a revocation. Bounded by storeTimeoutMs, so a hung
-        // write cannot hold the cleanup hostage. This closes the ordering
-        // window within a process; two processes racing on one store is
-        // outside what an in-process wrapper can serialize (see README).
-        if (pendingStoreWrite) {
-          await pendingStoreWrite.catch(() => {});
+        // BAJO-1: wait for EVERY store write still in flight from a concurrent
+        // saveTokens() of this instance, not merely the most recent one — an
+        // older straggler is exactly what would land after the delete below and
+        // restore a live-looking expiry behind a revocation. Each write is
+        // individually bounded by storeTimeoutMs, so a hung one cannot hold the
+        // cleanup hostage. This closes the ordering window within a process;
+        // two processes racing on one store is outside what an in-process
+        // wrapper can serialize (see README).
+        if (outstandingStoreWrites.size > 0) {
+          await Promise.all([...outstandingStoreWrites]);
         }
         // M5: an un-deleted persisted expiry would otherwise outlive the
         // credentials it described — remove it, or if the store can't delete,
         // overwrite it with a sentinel that reads as "already expired" rather
-        // than leaving the stale (still-valid-looking) value.
-        await runStoreOp(
-          expiryStore.delete ? 'delete' : 'set',
-          () =>
-            expiryStore.delete
-              ? expiryStore.delete(resourceKey)
-              : expiryStore.set(resourceKey, 0),
-          undefined,
+        // than leaving the stale (still-valid-looking) value. Queued like every
+        // other store write, so it is ordered after them rather than racing
+        // whatever was already on its way.
+        await queueStoreWrite(() =>
+          runStoreOp(
+            expiryStore.delete ? 'delete' : 'set',
+            () =>
+              expiryStore.delete
+                ? expiryStore.delete(resourceKey)
+                : expiryStore.set(resourceKey, 0),
+            undefined,
+          ),
         );
       }
     };
