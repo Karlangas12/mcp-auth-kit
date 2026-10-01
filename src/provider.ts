@@ -78,18 +78,23 @@ export interface McpAuthKitOptions {
   timeoutMs?: number;
   /**
    * How long, in ms, to keep a timed-out refresh request alive in the
-   * background in the hope of salvaging its result. **Default: 0 — salvage is
-   * off, and the refresh is aborted at `timeoutMs`.** Set it to a positive
-   * value to opt in.
+   * background in the hope of salvaging its result. **Default: 120000 (2 min).**
+   * Set it to `0` to abort at `timeoutMs` instead.
    *
-   * Off by default because keeping a request alive has costs that fall hardest
-   * on this package's main audience, short-lived CLI-style MCP clients: the
-   * in-flight request is a live socket the process may wait on, and the window
-   * widens the period in which a second attempt can resend the same
-   * `refresh_token` — which a strict authorization server may treat as token
-   * reuse and answer by revoking the whole family. Turn it on if your
-   * authorization server is slow enough that refreshes genuinely time out, and
-   * you would rather pay those costs than lose a rotated token.
+   * This defaulted to `0` while two of its costs were real. Both are now closed,
+   * which is what makes salvage safe to leave on:
+   *
+   * - A second refresh could go out with the same `refresh_token` while a
+   *   salvage still held it, which a strict authorization server reads as replay
+   *   and answers by revoking the whole family. A concurrent caller now joins
+   *   the salvage in flight instead of racing it (MEDIO-2).
+   * - A revoked credential's request stayed in flight for the rest of the
+   *   window. `invalidateCredentials()` now aborts it (MEDIO-1).
+   *
+   * What remains is the cost that cannot be closed from inside this package: a
+   * short-lived process may exit before the salvage lands, in which case the
+   * window bought nothing. It also costs nothing there — the deadline timer is
+   * unref'd, so it is never itself a reason for a process to stay alive.
    *
    * The refresh grant is a NON-IDEMPOTENT POST against an authorization server
    * that typically rotates the refresh token the moment it processes the
@@ -227,7 +232,7 @@ export function wrapOAuthClientProvider(
         )
       : undefined;
   const fetchFn = withTimeout(options.fetchFn, timeoutMs);
-  const refreshSalvageMs = options.refreshSalvageMs ?? 0;
+  const refreshSalvageMs = options.refreshSalvageMs ?? 120 * 1000;
   // The refresh grant gets a longer HARD deadline than the caller's soft one,
   // so a request that outlives `timeoutMs` stays alive long enough to be
   // salvaged instead of being aborted mid-rotation. Still bounded: it is a
@@ -285,6 +290,36 @@ export function wrapOAuthClientProvider(
    * the newer, valid tokens.
    */
   let refreshing: { generation: number; promise: Promise<OAuthTokens> } | undefined;
+  /**
+   * MEDIO-1 / MEDIO-2: a refresh that outlived its caller's soft timeout and is
+   * still in flight, together with the handle that cancels it.
+   *
+   * It is tracked rather than merely fired and forgotten because the request is
+   * still carrying a `refresh_token` the authorization server may already have
+   * consumed. Two things follow, and both need this slot: a revocation has to be
+   * able to cancel it (MEDIO-1), and a second refresh must not go out with that
+   * same `refresh_token` while it is outstanding (MEDIO-2) — a strict
+   * authorization server reads a second presentation of a rotated token as
+   * replay and answers by revoking the whole token family (RFC 6819 §5.2.2.3).
+   *
+   * `promise` never rejects: a salvage that fails has nothing to hand anyone.
+   */
+  let pendingSalvage:
+    | { generation: number; promise: Promise<OAuthTokens | undefined>; abort: () => void }
+    | undefined;
+
+  /**
+   * MEDIO-1: cancel an in-flight salvage and clear the slot. Idempotent, and
+   * safe to call when there is nothing pending.
+   *
+   * Clearing the slot first matters: `abort()` can settle the attempt
+   * synchronously, and the settle handler only releases a slot it still owns.
+   */
+  function abortPendingSalvage(): void {
+    const salvage = pendingSalvage;
+    pendingSalvage = undefined;
+    salvage?.abort();
+  }
   /** Whether we've already warned about an invalid expiryStore value this process. */
   let warnedInvalidExpiryValue = false;
   /** Whether we've already warned about an expiryStore operation timing out this process. */
@@ -353,8 +388,8 @@ export function wrapOAuthClientProvider(
    */
   /**
    * ALTO-1: serializes this wrapper's own mutations of the wrapped provider's
-   * credential storage, so a `saveTokens()` and an `invalidateCredentials()`
-   * that overlap are applied in call order rather than in I/O-completion order.
+   * credential storage — tokens AND client information — so mutations that
+   * overlap are applied in call order rather than in I/O-completion order.
    *
    * Detecting the overlap afterwards is not enough on its own. By the time a
    * generation re-check can see that credentials were invalidated mid-write,
@@ -362,19 +397,89 @@ export function wrapOAuthClientProvider(
    * are in storage and no later check can un-write them. The only way to keep
    * a revocation is to not let the write land after it.
    *
-   * Both callers are non-reentrant (neither saves from inside an invalidation
-   * nor the reverse), so this cannot deadlock. It bounds nothing: the queue
-   * only ever waits on the wrapped provider's own storage.
+   * What this queue does and does not bound (corrected — the previous wording
+   * here claimed it "bounds nothing", which was wrong):
+   *
+   * - It DOES couple each queued mutation's latency to the latency of every
+   *   mutation enqueued before it. A hung `provider.saveTokens()` therefore
+   *   delays everything behind it for as long as it hangs, with no timeout.
+   *   Bounding the queue is not the fix — bailing out of it re-opens ALTO-1 —
+   *   so the one caller for which delay is a security property, revocation,
+   *   does not wait on it at all. See `invalidateCredentials` below (MEDIO-B):
+   *   it revokes immediately and uses the queue only for a second, idempotent
+   *   ordering pass that nobody awaits.
+   * - It is per wrapper instance (a closure variable), so one wedged provider
+   *   cannot stall another server's credentials in the same process.
+   *
+   * Reentrancy (BAJO-C — the previous wording claimed a deadlock was
+   * impossible; it is not). The wrapped provider is third-party code running
+   * INSIDE this queue, so a provider whose `saveTokens` calls back into
+   * `wrapped.saveTokens`/`wrapped.invalidateCredentials` would enqueue work
+   * behind the very mutation that is awaiting it. `reentrancyDepth` is raised
+   * around the synchronous head of each queued mutation, which is where a
+   * storage layer that rejects a token it was just handed calls back from, and
+   * such a call is rejected immediately with a clear error instead of hanging.
+   * A provider that calls back only AFTER its own first `await` is outside
+   * what a synchronous marker can see; the wrapped provider must not do that,
+   * and the README states so. The invalidation path is structurally safe
+   * either way, since its queued pass is not awaited.
    */
   let credentialMutations: Promise<unknown> = Promise.resolve();
-  function serializeCredentialMutation<T>(run: () => Promise<T> | T): Promise<T> {
-    const next = credentialMutations.then(run, run);
+  let reentrancyDepth = 0;
+  function serializeCredentialMutation<T>(
+    run: () => Promise<T> | T,
+    /**
+     * Set only for work that nobody awaits. The guard exists to turn a deadlock
+     * into an error, and a mutation no caller is waiting on cannot deadlock —
+     * rejecting it would instead silently drop the ordering pass that keeps a
+     * reentrant revocation effective.
+     */
+    options?: { allowReentrant?: boolean },
+  ): Promise<T> {
+    if (reentrancyDepth > 0 && !options?.allowReentrant) {
+      return Promise.reject(
+        new McpAuthKitError(
+          'authorization',
+          'The wrapped provider called back into this wrapper from inside one of its own credential writes',
+          'a credential write (saveTokens / saveClientInformation / invalidateCredentials) must not call wrapped.saveTokens() or wrapped.invalidateCredentials() on the same wrapper instance — mcp-auth-kit applies these in call order, so a write that waits on work queued behind itself can never complete; call the underlying provider directly from inside that write instead',
+        ),
+      );
+    }
+    const guarded = (): Promise<T> | T => {
+      reentrancyDepth += 1;
+      try {
+        return run();
+      } finally {
+        // Lowered when `run` RETURNS, not when it settles: this marks the
+        // synchronous head of the provider's own call, which is the reentrant
+        // window a marker can attribute. Keeping it raised for the whole
+        // awaited body would reject legitimate concurrent callers, which is
+        // precisely what this queue exists to serialize rather than refuse.
+        reentrancyDepth -= 1;
+      }
+    };
+    const next = credentialMutations.then(guarded, guarded);
     credentialMutations = next.then(
       () => undefined,
       () => undefined,
     );
     return next;
   }
+
+  /**
+   * BAJO-D: bumped once per `invalidateCredentials()` call, synchronously, at
+   * call time — the moment the revocation becomes authoritative.
+   *
+   * The generation counter alone cannot carry this. It moves for two different
+   * reasons, and a save that finds it has moved must react to them oppositely:
+   * an invalidation means "bail, your tokens are revoked", while an earlier
+   * save means "you are the newer write, commit". Since the queue guarantees an
+   * earlier save completed before this one started, conflating the two made the
+   * later save skip its own expiry commit and leave storage holding ITS tokens
+   * under the EARLIER save's expiry. This counter is the discriminator: it moves
+   * only for revocations.
+   */
+  let invalidationCount = 0;
 
   function beginGeneration(reason: 'save' | 'invalidate'): number {
     expiryGeneration += 1;
@@ -502,8 +607,14 @@ export function wrapOAuthClientProvider(
     // setup, not something to paper over. See the README note under
     // "Design note: conditional delegation".
     const stamped: OAuthClientInformationFull = { ...registered, issuer: configuredIssuer };
-    // `provider.saveClientInformation` is guaranteed to exist: checked at wrap time above.
-    await provider.saveClientInformation!(stamped);
+    // MEDIO-A: client information is a credential too — it carries the
+    // `client_secret`. Ordered through the same queue as token writes, so a
+    // registration that started before an `invalidateCredentials()` cannot land
+    // after it and put a rejected client back on disk, leaving auth() to retry
+    // with the same `client_id` the server just refused instead of registering
+    // anew. `provider.saveClientInformation` is guaranteed to exist: checked at
+    // wrap time above.
+    await serializeCredentialMutation(() => provider.saveClientInformation!(stamped));
     return stamped;
   }
 
@@ -639,6 +750,13 @@ export function wrapOAuthClientProvider(
     if (refreshing && refreshing.generation === generation) {
       return refreshing.promise;
     }
+    // MEDIO-2: a salvage from this same generation is still holding this very
+    // `refresh_token`. Starting a second grant with it now is what makes a
+    // strict authorization server see replay and revoke the family, so join the
+    // one in flight instead of racing it.
+    if (pendingSalvage && pendingSalvage.generation === generation) {
+      return joinPendingSalvage(pendingSalvage);
+    }
     let tracked: Promise<OAuthTokens>;
     tracked = performRefresh(stored, generation).finally(() => {
       // Only release the slot if it still holds THIS refresh.
@@ -646,6 +764,49 @@ export function wrapOAuthClientProvider(
     });
     refreshing = { generation, promise: tracked };
     return tracked;
+  }
+
+  /**
+   * MEDIO-2: wait on an in-flight salvage instead of starting a competing
+   * refresh with the same `refresh_token`.
+   *
+   * The join inherits the same latency contract as the original attempt: the
+   * caller is released after `timeoutMs` whether or not the salvage has landed,
+   * so joining can never make a request wait the full salvage window. If the
+   * salvage concludes with nothing to hand back, this surfaces a retryable
+   * error rather than immediately firing the second grant it just avoided — by
+   * the time the caller retries, the slot is clear and a fresh refresh starts
+   * from whatever is actually stored.
+   */
+  async function joinPendingSalvage(salvage: {
+    promise: Promise<OAuthTokens | undefined>;
+  }): Promise<OAuthTokens> {
+    const timedOut = Symbol('salvage-join-timeout');
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      salvage.promise,
+      new Promise<typeof timedOut>((resolve) => {
+        // Delivers this caller's answer, like the soft timeout it mirrors, so
+        // it is deliberately not unref'd. See the note in runRefreshWithSalvage.
+        timer = setTimeout(() => resolve(timedOut), timeoutMs);
+      }),
+    ]);
+    if (timer !== undefined) clearTimeout(timer);
+
+    if (outcome !== timedOut && outcome !== undefined) return outcome;
+
+    // Thrown from refreshNow, which is outside performRefresh's catch, so this
+    // is what the caller actually sees — it carries the package's own error
+    // type rather than a bare Error, like every other failure callers are
+    // handed. It is deliberately NOT one of the three classes auth() reacts to
+    // by invalidating credentials: nothing here says the refresh_token is bad.
+    throw new McpAuthKitError(
+      'token_refresh',
+      outcome === timedOut
+        ? `A refresh for these credentials is already in flight and did not answer within timeoutMs (${timeoutMs}ms)`
+        : 'A refresh for these credentials was already in flight and did not yield usable tokens',
+      'retry the operation — a second refresh_token grant was deliberately not sent while the first is outstanding, because presenting a rotated refresh_token twice is what makes a strict authorization server revoke the whole token family; the in-flight attempt may still land and persist rotated credentials',
+    );
   }
 
   /**
@@ -688,6 +849,7 @@ export function wrapOAuthClientProvider(
   async function runRefreshWithSalvage(
     run: () => Promise<OAuthTokens>,
     generation: number,
+    abort: () => void,
   ): Promise<OAuthTokens> {
     if (refreshSalvageMs <= 0) return run();
 
@@ -715,25 +877,42 @@ export function wrapOAuthClientProvider(
     }
 
     // Soft timeout. Release the caller, keep the request.
-    void attempt.then(
-      async (late) => {
+    //
+    // MEDIO-2: the salvage is published before the caller is released, so a
+    // tokens() call arriving in the meantime joins it rather than sending the
+    // same refresh_token a second time.
+    let salvage: Promise<OAuthTokens | undefined>;
+    salvage = attempt.then(
+      async (late): Promise<OAuthTokens | undefined> => {
         // The salvage may land long after the caller gave up, so it is exactly
         // the kind of late writer rounds 4-7 exist to guard: only apply it if
         // nothing authoritative has happened since this attempt started.
-        if (generation !== expiryGeneration) return;
+        if (generation !== expiryGeneration) return undefined;
+        const stamped: OAuthTokens = { ...late, issuer: configuredIssuer };
         try {
-          await saveTokens({ ...late, issuer: configuredIssuer });
+          await saveTokens(stamped);
         } catch {
           // Best effort: the caller already failed this attempt, and the
-          // wrapped provider's own storage error is its to surface.
+          // wrapped provider's own storage error is its to surface. The tokens
+          // themselves are still good, so a joiner still gets them.
         }
+        return stamped;
       },
       () => {
         // A late FAILURE has nothing to salvage. It also must not open the
         // failure-cache window or be rethrown: it belongs to an attempt the
-        // caller has already been told failed.
+        // caller has already been told failed. Joiners see `undefined` and get
+        // a retryable error rather than inheriting a failure they never asked
+        // for.
+        return undefined;
       },
     );
+    pendingSalvage = { generation, promise: salvage, abort };
+    void salvage.then(() => {
+      // Only release the slot if it still holds THIS salvage — same discipline
+      // as the `refreshing` slot above.
+      if (pendingSalvage?.promise === salvage) pendingSalvage = undefined;
+    });
 
     const softTimeout = new Error(
       `The refresh request did not answer within timeoutMs (${timeoutMs}ms)`,
@@ -796,6 +975,12 @@ export function wrapOAuthClientProvider(
       );
     }
 
+    // MEDIO-1: the handle a revocation uses to cancel this request if it is
+    // still in flight as a salvage. `withTimeout` combines a caller-supplied
+    // signal with its own deadline rather than overriding it, so this composes
+    // with the salvage deadline instead of replacing it.
+    const salvageAbort = new AbortController();
+
     let refreshed: OAuthTokens;
     try {
       refreshed = await runRefreshWithSalvage(
@@ -805,9 +990,21 @@ export function wrapOAuthClientProvider(
             refreshToken: stored.refresh_token as string,
             resource,
             addClientAuthentication: provider.addClientAuthentication,
-            fetchFn: refreshFetchFn,
+            fetchFn: (url, init) => {
+              // Fold any signal the SDK supplies into ours rather than dropping
+              // either one — both must be able to cancel this request.
+              if (init?.signal) {
+                if (init.signal.aborted) salvageAbort.abort();
+                else
+                  init.signal.addEventListener('abort', () => salvageAbort.abort(), {
+                    once: true,
+                  });
+              }
+              return refreshFetchFn(url, { ...init, signal: salvageAbort.signal });
+            },
           }),
         generation,
+        () => salvageAbort.abort(),
       );
     } catch (error) {
       // sanitizedCause mutates `error.message` (and `errorUri`) in place and
@@ -886,11 +1083,26 @@ export function wrapOAuthClientProvider(
     // error and leave `expiresAt` untouched rather than believing a token
     // was saved when it wasn't (which would silently serve a stale token
     // forever afterward).
-    // ALTO-1: the generation this save belongs to, captured before the write.
-    const generationAtEntry = expiryGeneration;
-    // Ordered against any concurrent invalidateCredentials(), so a revocation
+    // BAJO-D: revocations are counted at CALL time, so this captures every
+    // invalidation that arrives from here on — whether while this save waits
+    // for its turn or while its write is in flight.
+    const invalidationsAtEntry = invalidationCount;
+    // BAJO-D: the generation is captured when this save ACQUIRES ITS TURN, not
+    // at the call site. Captured at the call site, two saves enqueued before
+    // either had written shared one starting generation, and the second one
+    // then misread the first one's bump as "someone superseded me" — skipping
+    // its own expiry commit and leaving storage holding ITS tokens under the
+    // FIRST save's expiry. Rounds 6-7 established that a generation is captured
+    // alongside the data it describes; the data here is the write this closure
+    // is about to perform, which is what the queue has just authorized, not the
+    // call that requested it.
+    let generationAtTurn = expiryGeneration;
+    // Ordered against any concurrent credential mutation, so a revocation
     // called after this save cannot be overtaken by this save's storage write.
-    await serializeCredentialMutation(() => provider.saveTokens(newTokens));
+    await serializeCredentialMutation(() => {
+      generationAtTurn = expiryGeneration;
+      return provider.saveTokens(newTokens);
+    });
     // ALTO-1: re-check AFTER the write resolves, not only before it started.
     // `provider.saveTokens` is real I/O — disk, keychain, network — and an
     // `invalidateCredentials()` landing during it clears the state and writes
@@ -898,7 +1110,12 @@ export function wrapOAuthClientProvider(
     // over a revocation and overwrite that sentinel in the store. Every caller
     // of this function checks the generation before calling it; that check
     // alone cannot see what happens during the await.
-    if (generationAtEntry !== expiryGeneration) return;
+    //
+    // The two conditions are not redundant. The counter catches a revocation,
+    // which is the case that must bail; the generation catches anything else
+    // that made this write non-current by the time it landed.
+    if (invalidationsAtEntry !== invalidationCount) return;
+    if (generationAtTurn !== expiryGeneration) return;
     const ttlMs =
       newTokens.expires_in !== undefined
         ? clampServerExpiresInSeconds(newTokens.expires_in) * 1000
@@ -962,7 +1179,13 @@ export function wrapOAuthClientProvider(
     wrapped.state = () => provider.state!();
   }
   if (provider.saveClientInformation) {
-    wrapped.saveClientInformation = (info) => provider.saveClientInformation!(info);
+    // MEDIO-A: same queue as every other credential write — see the note in
+    // the auto-registration path. This is the pass-through the SDK's own
+    // bindClientInformation() uses (auth.js:289), which re-saves the stored
+    // client info on every auth() run, so it is the likeliest writer to
+    // overlap a concurrent revocation.
+    wrapped.saveClientInformation = (info) =>
+      serializeCredentialMutation(() => provider.saveClientInformation!(info));
   }
   if (provider.addClientAuthentication) {
     wrapped.addClientAuthentication = provider.addClientAuthentication;
@@ -978,32 +1201,76 @@ export function wrapOAuthClientProvider(
   }
   if (provider.invalidateCredentials) {
     wrapped.invalidateCredentials = async (scope) => {
-      if (scope !== 'all' && scope !== 'tokens') {
-        return provider.invalidateCredentials!(scope);
+      const tracked = scope === 'all' || scope === 'tokens';
+
+      // Everything that must be true the instant this call is made happens
+      // here, synchronously, before any await: a concurrent saveTokens() whose
+      // write is already in flight has to be able to see this revocation the
+      // moment it lands, and a tokens() running now must not serve what is
+      // being revoked.
+      if (tracked) {
+        // BAJO-D: counted at call time. This is what tells a landing save
+        // "a revocation happened, bail" as distinct from "an earlier save
+        // moved the generation, you are the newer write, commit".
+        invalidationCount += 1;
+        // Start a new generation: anything still in flight from the previous
+        // one (a cold store read, a refresh) now describes credentials that no
+        // longer exist, and commitExpiryState will drop whatever it tries to
+        // write.
+        const generation = beginGeneration('invalidate');
+        commitExpiryState(generation, {
+          expiresAt: undefined,
+          // Force the next tokens() call to re-consult expiryStore rather than
+          // trusting a cached "nothing to check" from before the invalidation.
+          expiryStoreChecked: false,
+          // Bajo-7: the credentials that failed are being discarded, so the
+          // suppression window they opened no longer applies.
+          refreshFailure: null,
+        });
+        // Drop the shared in-flight read so the next one starts from scratch
+        // rather than reusing a promise issued for the old generation.
+        expiryLoad = undefined;
+        // MEDIO-1: a salvage still waiting on a refresh response belongs to
+        // credentials that no longer exist. Its write would be discarded by the
+        // generation check anyway, but leaving the request in flight keeps a
+        // rotated refresh_token moving on a connection the user just asked to
+        // tear down, and holds the socket for the rest of the salvage window.
+        abortPendingSalvage();
       }
 
-      // Start a new generation FIRST: anything still in flight from the
-      // previous one (a cold store read, a refresh) now describes credentials
-      // that no longer exist, and commitExpiryState will drop whatever it tries
-      // to write.
-      const generation = beginGeneration('invalidate');
-      commitExpiryState(generation, {
-        expiresAt: undefined,
-        // Force the next tokens() call to re-consult expiryStore rather than
-        // trusting a cached "nothing to check" from before the invalidation.
-        expiryStoreChecked: false,
-        // Bajo-7: the credentials that failed are being discarded, so the
-        // suppression window they opened no longer applies.
-        refreshFailure: null,
-      });
-      // Drop the shared in-flight read so the next one starts from scratch
-      // rather than reusing a promise issued for the old generation.
-      expiryLoad = undefined;
+      // MEDIO-B: revoke at the wrapped provider IMMEDIATELY, never from behind
+      // the queue. A revocation's latency is a security property: `storeTimeoutMs`
+      // exists precisely so a slow dependency cannot stand between a revocation
+      // request and the credentials being gone, and the SDK's auth() awaits this
+      // call before retrying (auth.js:191/195), so blocking here stalls its whole
+      // recovery path. Queueing this behind an in-flight `provider.saveTokens()`
+      // made a hung storage layer do exactly that.
+      //
+      // Ordering is preserved by a SECOND, idempotent pass queued behind
+      // whatever was already in flight — so a save that started before this call
+      // and lands after the immediate revocation is followed by another
+      // revocation rather than left standing. Nobody awaits that pass: awaiting
+      // it would reinstate the block it exists to avoid, and the caller's own
+      // guarantee ("the credentials are gone now") is already satisfied by the
+      // immediate call above. It is also what keeps a reentrant invalidation
+      // from inside a provider write structurally deadlock-free (BAJO-C).
+      const revokeNow = provider.invalidateCredentials!(scope);
+      const revokeInOrder = serializeCredentialMutation(
+        () => provider.invalidateCredentials!(scope),
+        // Nobody awaits this pass, so it cannot deadlock even when the provider
+        // revokes from inside its own write — and in that case it is precisely
+        // what stops the write it is nested in from standing.
+        { allowReentrant: true },
+      );
+      // Never unhandled: the immediate call is the one whose failure the caller
+      // must see, and this one's identical error would otherwise surface as an
+      // unhandled rejection.
+      void revokeInOrder.catch(() => {});
 
-      // MEDIO-3: revoke at the wrapped provider — the thing that actually holds
-      // the credentials — BEFORE touching the store. A slow or hung expiry cache
-      // must never be what stands between a revocation request and the tokens
-      // being gone, nor stall the SDK's auth() recovery, which awaits this call.
+      // MEDIO-3: the wrapped provider — the thing that actually holds the
+      // credentials — is revoked BEFORE the store is touched. A slow or hung
+      // expiry cache must never be what stands between a revocation request and
+      // the tokens being gone.
       //
       // If this throws, the store cleanup below is skipped and a persisted
       // expiry can outlive this call. That is deliberate and coherent, not a
@@ -1011,10 +1278,9 @@ export function wrapOAuthClientProvider(
       // there, and the expiry that describes them is still the right answer for
       // them. The caller sees the failure and can retry. Writing the revocation
       // sentinel here instead would claim a revocation that did not happen.
-      // ALTO-1: ordered against any in-flight saveTokens() of this wrapper, so
-      // a save that started before this call cannot land after it and put the
-      // revoked credentials back into storage.
-      await serializeCredentialMutation(() => provider.invalidateCredentials!(scope));
+      await revokeNow;
+
+      if (!tracked) return;
 
       if (expiryStore) {
         // Order this cleanup after any store write still in flight from a

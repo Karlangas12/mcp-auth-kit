@@ -101,7 +101,11 @@ describe('MEDIO-3: a hung expiryStore cannot stall or skip credential invalidati
 
     // The decisive assertion: revocation reached the thing that actually holds
     // the credentials, even though the expiry cache never answered.
-    expect(inner.invalidateCredentialsCalls).toEqual(['all']);
+    // MEDIO-B: the revocation reaches the provider immediately, and a second,
+    // idempotent pass is queued behind anything already in flight so a save
+    // that started earlier cannot land after it. Both carry the same scope.
+    expect(inner.invalidateCredentialsCalls[0]).toBe('all');
+    expect(new Set(inner.invalidateCredentialsCalls)).toEqual(new Set(['all']));
     expect(await inner.tokens()).toBeUndefined();
   });
 
@@ -133,8 +137,12 @@ describe('MEDIO-3: a hung expiryStore cannot stall or skip credential invalidati
 
     await wrapped.invalidateCredentials!('tokens');
 
-    // Revocation first, cache housekeeping second.
-    expect(order).toEqual(['provider-invalidate', 'store-delete']);
+    // Revocation first, cache housekeeping second. The queued second pass
+    // (MEDIO-B) is idempotent and unordered with respect to the store cleanup,
+    // so only the first revocation's position is asserted.
+    expect(order[0]).toBe('provider-invalidate');
+    expect(order.indexOf('store-delete')).toBeGreaterThan(-1);
+    expect(order.filter((e) => e === 'store-delete')).toHaveLength(1);
   });
 });
 

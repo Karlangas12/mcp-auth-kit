@@ -140,6 +140,11 @@ describe('Bajo-7: a definitively-failed refresh is not retried within the failur
       authorizationServerUrl: 'https://auth.example.com',
       fetchFn: fetchFn as unknown as typeof fetch,
       timeoutMs: 20,
+      // Salvage off, so each attempt is a genuinely new request. With salvage
+      // on, the second call deliberately joins the first rather than sending
+      // the same refresh_token again — that is MEDIO-2, covered separately in
+      // salvage-reuse.test.ts.
+      refreshSalvageMs: 0,
     });
     await seedExpiredTokens(wrapped);
 

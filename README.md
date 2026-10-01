@@ -54,21 +54,28 @@ interface and returns another one — same interface, same call sites — with:
    > processes the request, so aborting at `timeoutMs` would destroy
    > credentials: the old token is already dead server-side and the response
    > carrying the new one goes away with the connection. So `timeoutMs`
-   > releases the *caller*, and — **if you opt in by setting
-   > `refreshSalvageMs`** — the request itself stays alive for up to that
-   > long. If it lands with tokens they are persisted, under the same
-   > generation check as every other late result, so a response arriving
-   > after its credentials were replaced or revoked is discarded rather than
-   > resurrected. The caller's attempt still fails at `timeoutMs`; the
-   > salvage shows up on the next `tokens()` call.
+   > releases the *caller*, and the request itself stays alive for up to
+   > `refreshSalvageMs` (default 2 min). If it lands with tokens they are
+   > persisted, under the same generation check as every other late result,
+   > so a response arriving after its credentials were replaced or revoked is
+   > discarded rather than resurrected. The caller's attempt still fails at
+   > `timeoutMs`; the salvage shows up on the next `tokens()` call. Set
+   > `refreshSalvageMs: 0` to abort at `timeoutMs` instead.
    >
-   > The salvage is **off by default** (`refreshSalvageMs: 0`) because it
-   > only pays off for a process that outlives the window. Most MCP clients
-   > are short-lived: the process exits before the salvage can land, so all
-   > the window buys is a longer period during which an already-rotated
-   > refresh token is in flight. Turn it on for a long-running client — a
-   > daemon, a server, an editor extension — where the next `tokens()` call
-   > is minutes away and the salvage has somewhere to arrive.
+   > Keeping a request alive past its caller means a `refresh_token` the
+   > server has very likely already consumed is still outstanding, so two
+   > things follow from it:
+   >
+   > - **No second grant goes out with that token while the first is in
+   >   flight.** A `tokens()` call arriving meanwhile joins the outstanding
+   >   request rather than racing it — presenting a rotated refresh token
+   >   twice is what RFC 6819 §5.2.2.3 describes as replay, and a strict
+   >   authorization server answers it by revoking the whole family. The
+   >   joiner gets its own `timeoutMs` budget, so joining never makes a
+   >   request wait out the salvage window.
+   > - **`invalidateCredentials()` cancels it.** A revoked user's refresh
+   >   must stop moving on the wire, not merely have its result ignored when
+   >   it lands.
 3. **Retried dynamic client registration — only when it's worth retrying.**
    If the wrapped provider has no stored client information and you opt in
    via the `registration` option, mcp-auth-kit performs RFC 7591 dynamic
@@ -400,11 +407,43 @@ implementations look like. If your provider implements
   mcp-auth-kit's own timeout — are never cached, since those may well
   succeed on the next attempt. The window is cleared by a successful
   `saveTokens()` or by `invalidateCredentials()`.
-- **`refreshSalvageMs`** (default `0`, i.e. off) — how long a timed-out
-  refresh request is kept alive in the background so a late response can
-  still be persisted, instead of aborting mid-rotation and destroying the
-  credentials. See the note under point 2 above for when it's worth turning
-  on. At `0`, a refresh aborts at `timeoutMs`.
+- **`refreshSalvageMs`** (default 120000) — how long a timed-out refresh
+  request is kept alive in the background so a late response can still be
+  persisted, instead of aborting mid-rotation and destroying the credentials.
+  While one is outstanding, a concurrent `tokens()` joins it instead of
+  sending the same `refresh_token` again, and `invalidateCredentials()`
+  cancels it. See the note under point 2 above. `0` disables salvage and
+  aborts at `timeoutMs`.
+
+## What the wrapper requires of your provider
+
+One rule, and it is the only one: **a credential write must not call back into
+the wrapper.** Inside your `saveTokens`, `saveClientInformation` or
+`invalidateCredentials`, do not call `wrapped.saveTokens()` or
+`wrapped.invalidateCredentials()` on the same instance — call whatever you need
+directly instead.
+
+The reason is that mcp-auth-kit applies credential writes in call order rather
+than in I/O-completion order. Without that, a `saveTokens()` already in flight
+when you log out lands *after* the revocation and puts the revoked credentials
+back on disk, where no later check can remove them. Ordering them means a write
+that waits on work queued behind itself can never finish, so a reentrant call is
+rejected immediately with an `McpAuthKitError` naming the problem rather than
+hanging. The detection sees the synchronous part of your write, which is where
+this realistically happens (a storage layer that rejects a token it was just
+handed); a provider that calls back only after its own first `await` is outside
+what the wrapper can see, which is why the rule is stated rather than merely
+enforced. Revocation is exempt and always safe: it reaches your provider
+immediately, never from behind the queue.
+
+That ordering is also the one place the wrapper couples its callers' latency: a
+mutation waits for every mutation enqueued before it, with no timeout. A hung
+`saveTokens` therefore delays later writes for as long as it hangs. It does
+*not* delay revocation — `invalidateCredentials()` calls your provider straight
+away and uses the queue only for a second, idempotent pass that nobody waits on
+— and it does not delay reads: `tokens()` and `clientInformation()` never queue.
+The queue is per wrapper instance, so one wedged keychain cannot stall another
+server's credentials in the same process.
 
 ## A note on timers and process lifetime
 
@@ -412,11 +451,11 @@ The package is used mostly by short-lived processes, so it is careful about
 what it lets keep the Node event loop alive. The deadline timer behind every
 HTTP call (`timeoutMs`) is `unref()`'d: it still fires whenever the process
 is otherwise running, but it never by itself becomes the reason a process
-hasn't exited. The two timers that *are* the caller's answer rather than a
-safety net — the registration/refresh backoff delay, and the soft `timeoutMs`
-that releases a caller waiting on a salvaged refresh — are deliberately left
-ref'd, since unref'ing them would let a process exit mid-wait and leave the
-caller's promise forever unsettled.
+hasn't exited. The timers that *are* the caller's answer rather than a safety
+net — the registration/refresh backoff delay, the bound on an `expiryStore`
+operation, and the soft `timeoutMs` that releases a caller waiting on a
+salvaged refresh — are deliberately left ref'd, since unref'ing them would let
+a process exit mid-wait and leave the caller's promise forever unsettled.
 
 What this does **not** control is anything below the wrapper. An abort tells
 your `fetchFn` to give up; whether it actually closes the socket, and whether

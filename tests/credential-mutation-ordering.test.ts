@@ -123,8 +123,13 @@ describe('ALTO-1: a revocation cannot be overtaken by a save that started before
     // ...and on the persisted expiry, which must not be an expiry for tokens
     // that no longer exist.
     expect(storeValues.has('k')).toBe(false);
-    // The save was ordered before the revocation rather than racing it.
-    expect(log).toEqual(['SAVE:old', 'SAVE:REFRESHED', 'INVALIDATE']);
+    // MEDIO-B: the revocation now fires immediately AND queues a second,
+    // idempotent pass behind the in-flight save — so the save is still followed
+    // by a revocation rather than being the last word, without the revocation
+    // having to wait on it.
+    expect(log[0]).toBe('SAVE:old');
+    expect(log.at(-1)).toBe('INVALIDATE');
+    expect(log.indexOf('SAVE:REFRESHED')).toBeLessThan(log.lastIndexOf('INVALIDATE'));
   });
 
   it('a save issued AFTER a revocation still wins, as call order demands', async () => {
@@ -207,8 +212,8 @@ describe('ALTO-2: a pending fetch deadline does not keep the process alive', () 
   });
 });
 
-describe('1.0.1: salvage is opt-in', () => {
-  it('is off unless refreshSalvageMs is set, so the refresh aborts at timeoutMs', async () => {
+describe('1.0.1: refreshSalvageMs: 0 still aborts at timeoutMs', () => {
+  it('does not salvage when explicitly disabled', async () => {
     const state = { rotated: false };
     const fetchFn = (_u: string | URL, init?: RequestInit) =>
       new Promise<Response>((resolve, reject) => {
@@ -231,7 +236,7 @@ describe('1.0.1: salvage is opt-in', () => {
       authorizationServerUrl: AS,
       fetchFn: fetchFn as unknown as typeof fetch,
       timeoutMs: 50,
-      // refreshSalvageMs deliberately not set
+      refreshSalvageMs: 0,
       minExpiresInSeconds: 1,
       refreshMarginMs: 0,
     });
@@ -248,7 +253,7 @@ describe('1.0.1: salvage is opt-in', () => {
     await sleep(300);
 
     expect(state.rotated).toBe(true);
-    // No salvage by default: the rotated token is not picked up.
+    // Salvage explicitly off: the rotated token is not picked up.
     expect((peek() as { refresh_token?: string })?.refresh_token).toBe('old-rt');
   });
 });
