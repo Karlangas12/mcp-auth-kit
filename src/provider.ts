@@ -1169,6 +1169,28 @@ export function wrapOAuthClientProvider(
     // alongside the data it describes; the data here is the write this closure
     // is about to perform, which is what the queue has just authorized, not the
     // call that requested it.
+    //
+    // KNOWN FRAGILITY, recorded deliberately rather than papered over. For two
+    // overlapping saves this is correct only because of MICROTASK ORDERING, not
+    // because of an explicit barrier: the earlier save's post-write block —
+    // which calls beginGeneration() — is a `.then` continuation registered on
+    // the queue inside serializeCredentialMutation BEFORE its caller awaits, so
+    // it runs before the later save's closure here reads expiryGeneration. That
+    // holds on every conforming promise implementation and is verified by test,
+    // but it is an ordering property rather than something enforced in the
+    // code, so it is invisible to a reader of either function alone.
+    //
+    // It was left as an ordering property on purpose. Making it explicit means
+    // holding the queue turn across the post-write commit, which would put the
+    // expiryStore write (bounded, but still I/O) inside the critical section
+    // every credential mutation waits on — trading a correctness property that
+    // currently holds for a new latency coupling on the path that revocation
+    // ordering depends on. The failure this would guard against is also benign
+    // by comparison: a stale expiry, self-healing on the transport's next 401.
+    // If a future change moves beginGeneration() off that synchronous
+    // continuation, this assumption breaks silently — the test named
+    // "the later of two overlapping saves owns both storage and expiry" is what
+    // catches that.
     let generationAtTurn = expiryGeneration;
     // Ordered against any concurrent credential mutation, so a revocation
     // called after this save cannot be overtaken by this save's storage write.

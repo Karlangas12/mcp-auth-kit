@@ -436,6 +436,20 @@ what the wrapper can see, which is why the rule is stated rather than merely
 enforced. Revocation is exempt and always safe: it reaches your provider
 immediately, never from behind the queue.
 
+**One known fragility, stated rather than hidden.** When two `saveTokens()`
+calls overlap, the later one is the write that stands *and* the expiry that
+stands. That is correct today because of microtask ordering — the earlier
+save's bookkeeping runs as a continuation registered on the queue before its
+caller awaits, so it completes before the later save reads the state it
+compares against — and not because of an explicit lock. It holds on every
+conforming promise implementation and is covered by a test, but it is an
+ordering property rather than an enforced one. It was left that way on
+purpose: making it explicit means holding the mutation queue across the
+bookkeeping, which would drag expiry-cache I/O into the critical section that
+revocation ordering depends on. The worst case if it ever broke is a stale
+persisted expiry, which the transport's next 401 repairs; the worst case of
+the alternative is a revocation queued behind a cache write.
+
 That ordering is also the one place the wrapper couples its callers' latency: a
 mutation waits for every mutation enqueued before it, with no timeout. A hung
 `saveTokens` therefore delays later writes for as long as it hangs. It does
