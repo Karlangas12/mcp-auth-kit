@@ -441,9 +441,15 @@ calls overlap, the later one is the write that stands *and* the expiry that
 stands. That is correct today because of microtask ordering — the earlier
 save's bookkeeping runs as a continuation registered on the queue before its
 caller awaits, so it completes before the later save reads the state it
-compares against — and not because of an explicit lock. It holds on every
-conforming promise implementation and is covered by a test, but it is an
-ordering property rather than an enforced one. It was left that way on
+compares against — and not because of an explicit lock. The margin is exactly
+one tick, and it is deterministic rather than implementation-dependent: the
+queue registers the successor's chain link on the shared promise *before*
+handing that promise to the predecessor's `await`, so under ECMA-262's
+reaction-ordering rules the successor always runs one microtask behind the
+predecessor's bookkeeping. Thenable assimilation and extra microtask hops in
+the wrapped provider are absorbed before that promise settles, so they shift
+both reactions equally. It is still an ordering property rather than an
+enforced one. It was left that way on
 purpose: making it explicit means holding the mutation queue across the
 bookkeeping, which would drag expiry-cache I/O into the critical section that
 revocation ordering depends on. The worst case if it ever broke is a stale
