@@ -267,7 +267,7 @@ not this behavior.
 ## Error contract
 
 Most failures arrive as `McpAuthKitError`, with a `phase` (`token_refresh`,
-`client_registration`, `resource_validation`, `authorization`), a concrete
+`client_registration`, `authorization`), a concrete
 remediation string, and the underlying error preserved as `.cause` with its
 real type intact.
 
@@ -461,7 +461,9 @@ mutation waits for every mutation enqueued before it, with no timeout. A hung
 `saveTokens` therefore delays later writes for as long as it hangs. It does
 *not* delay revocation — `invalidateCredentials()` calls your provider straight
 away and uses the queue only for a second, idempotent pass that nobody waits on
-— and it does not delay reads: `tokens()` and `clientInformation()` never queue.
+— and it does not delay `tokens()`, which never queues.
+(`clientInformation()` does queue, but only on the auto-registration path,
+where it is itself writing a credential.)
 The queue is per wrapper instance, so one wedged keychain cannot stall another
 server's credentials in the same process.
 
@@ -615,32 +617,25 @@ against (that's what the issuer check above is for). A store an attacker can
 write to can, at worst, make refresh happen too early or too late; it cannot
 redirect a refresh_token or client_secret anywhere.
 
-#### Known limitation: write ordering
+#### Known limitation: write ordering across processes
 
-`invalidateCredentials()` waits for a store write still in flight from a
-concurrent `saveTokens()` of the same instance before writing its own revocation
-sentinel, so a slow expiry write does not land after the sentinel and leave a
-live-looking expiry behind a revocation.
+Within one process, write ordering is closed. Every `expiryStore` write this
+wrapper issues goes through a serialized chain that waits for the store to
+actually apply each operation, and `invalidateCredentials()`'s own delete is
+enqueued behind whatever was already issued — so an expiry write cannot land
+after the revocation that followed it, however slow the store is. What
+`storeTimeoutMs` bounds is how long a *caller* waits to be told the write
+finished, not the ordering: a slow store delays the chain, never reorders it,
+and never delays a credential write, a revocation or a read.
 
-That ordering holds **as long as the store answers within `storeTimeoutMs`**, and
-only then. The wait is bounded by that timeout — deliberately, so a hung store
-cannot hold a revocation hostage — which means it waits for mcp-auth-kit to
-*stop awaiting* the write, not for the store to actually apply it. If a write
-exceeds `storeTimeoutMs`, it is abandoned, the sentinel is written, and the
-abandoned write may still land afterwards and overwrite it. (`ExpiryStore` has no
-cancellation contract, so there is nothing to cancel.) Raising `storeTimeoutMs`
-above your store's realistic worst-case latency keeps this closed.
+What cannot be closed in-process is **two processes racing on one shared
+store**: if process A is mid-`saveTokens()` while process B revokes, A's expiry
+write may still land after B's sentinel. With a store whose operations complete
+out of issue order — anything network-backed, or concurrent file writes — that
+window is real rather than theoretical.
 
-The same applies, and cannot be closed in-process at all, to **two processes
-racing on one shared store**: if process A is mid-`saveTokens()` while process B
-revokes, A's expiry write may still land after B's sentinel. With a store whose
-operations complete out of issue order — anything network-backed, or concurrent
-file writes — both windows are real rather than theoretical.
-
-Either way the outcome is the same, and so is the reasoning below for why it is
-tolerable: a stale expiry entry, never a redirected credential.
-
-Its practical impact is low, and it is worth being precise about why:
+The outcome is a stale expiry entry, never a redirected credential, and its
+practical impact is low. It is worth being precise about why:
 
 - If the wrapped provider deletes its tokens on invalidation (what the SDK's
   interface intends, and what `auth()`'s recovery relies on), the stale entry is
@@ -653,9 +648,8 @@ Its practical impact is low, and it is worth being precise about why:
 - The store never influences *where* credentials are sent, only *when* a refresh
   is attempted, so this cannot redirect a token anywhere.
 
-If you want it fully closed, give the store serialized writes — a single writer,
-a queue, or one connection — and set `storeTimeoutMs` above its realistic
-worst-case latency. Then the ordering holds across processes too.
+If you want it closed across processes too, give the store serialized writes — a
+single writer, a queue, or one connection.
 
 ### Which to use
 
@@ -691,7 +685,7 @@ each one is pinned by a test that first reproduces the failure against an
 unwrapped provider. Several tests drive the SDK's real `auth()` orchestrator
 rather than a mock, because the bugs that mattered most only appeared through
 its own control flow. The commit history is deliberately unsquashed: the
-package went through seven rounds of adversarial security review, and each
+package went through multiple rounds of adversarial security review, and each
 round's findings and fixes are traceable in it.
 
 Three of those tests are **drift guards** rather than feature tests, and they

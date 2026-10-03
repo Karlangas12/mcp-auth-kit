@@ -324,22 +324,17 @@ describe('MEDIO-1: write ordering holds only within storeTimeoutMs, as documente
     expect(values.get('k')).toBe(0);
   });
 
-  it('store SLOWER than the timeout: the late write lands after the sentinel — the documented limitation', async () => {
+  it('store SLOWER than the timeout: ordering STILL holds — the former limitation, now closed', async () => {
     const { values, applied } = await runRevokeDuringSave(300, 40);
 
-    // This is the behaviour the README documents as the limitation, and the
-    // reason it is acceptable: a stale expiry entry, never a redirected
-    // credential. Pinned so the README and the code cannot drift apart.
-    expect(applied).toEqual(['sentinel', 'expiry']);
-    expect(values.get('k')).not.toBe(0);
-
-    // And the impact bound the README relies on: the wrapped provider really
-    // did revoke, so the stale entry is inert — tokens() has nothing to judge.
-    const inner = new InMemoryProvider(testClientMetadata, {
-      canInvalidateCredentials: true,
-      invalidateClearsCredentials: true,
-    });
-    expect(await inner.tokens()).toBeUndefined();
+    // MEDIO-2: this case used to assert the bug — `['sentinel', 'expiry']`, a
+    // future expiry applied by the store after the revocation's sentinel,
+    // because the waiter gave up at storeTimeoutMs and let the next queued
+    // operation start while the real write was still running. The store-write
+    // chain now waits for the RAW operation, so ordering reflects when the
+    // store actually applied the write; only the CALLER's wait is bounded.
+    expect(applied).toEqual(['expiry', 'sentinel']);
+    expect(values.get('k')).toBe(0);
   });
 });
 

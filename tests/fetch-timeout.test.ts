@@ -43,21 +43,22 @@ describe('withTimeout (Bajo-1): respects a caller-supplied AbortSignal instead o
     ).rejects.toMatchObject({ name: 'AbortError' });
   });
 
-  it('does not abort if the caller signal is already aborted before the call even starts', async () => {
+  it('refuses to delegate at all when the caller signal is already aborted', async () => {
+    // BAJO-5: previously the underlying fetch WAS invoked, with an aborted
+    // signal, and it was left to that implementation to reject. Node's own
+    // fetch does, but `base` is caller-supplied, and one that ignores the
+    // signal would put an already-cancelled request on the wire — on the
+    // refresh path, a refresh_token whose credentials were just revoked.
     const callerController = new AbortController();
     callerController.abort();
 
-    let observedAborted = false;
-    const fetchFn = vi.fn((_url: string | URL, init?: RequestInit) => {
-      observedAborted = init?.signal?.aborted ?? false;
-      return Promise.reject(new DOMException('The operation was aborted', 'AbortError'));
-    });
-
+    const fetchFn = vi.fn(() => Promise.resolve(new Response('should never happen')));
     const wrapped = withTimeout(fetchFn as unknown as typeof fetch, 60_000);
+
     await expect(
       wrapped('https://example.com', { signal: callerController.signal }),
-    ).rejects.toBeTruthy();
-    expect(observedAborted).toBe(true);
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetchFn).not.toHaveBeenCalled();
   });
 
   it('works normally with no caller-supplied signal at all', async () => {

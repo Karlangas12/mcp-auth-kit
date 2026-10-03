@@ -415,28 +415,41 @@ export function wrapOAuthClientProvider(
    */
   let storeWrites: Promise<unknown> = Promise.resolve();
 
-  function queueStoreWrite(run: () => Promise<void>): Promise<void> {
-    const next = storeWrites.then(run, run);
-    storeWrites = next.then(
-      () => undefined,
-      () => undefined,
-    );
-    // Neutralized, so waiting on it never resurfaces an error runStoreOp has
-    // already handled.
-    const settled = next.then(
-      () => undefined,
-      () => undefined,
-    );
+  function queueStoreWrite(label: string, op: () => Promise<unknown>): Promise<void> {
+    // MEDIO-2: the chain waits for the RAW operation, not for a bounded view of
+    // it. Chaining on a bounded wrapper meant that a store slower than
+    // `storeTimeoutMs` had its write abandoned by the waiter while the real
+    // write kept running — so the next queued operation started anyway and a
+    // `set` could still be applied by the store AFTER the revocation's
+    // `delete`, putting a future expiry back behind a logout. Ordering has to
+    // reflect when the store actually applied the write; only the CALLER's wait
+    // is bounded, by the deadline below.
+    //
+    // `Promise.resolve().then(op)` rather than `op()`: a store that violates
+    // its own `Promise<...>` contract and throws synchronously must not
+    // propagate out of here, and a failing store must degrade exactly like a
+    // missing one.
+    const raw = (): Promise<void> =>
+      Promise.resolve()
+        .then(op)
+        .then(
+          () => undefined,
+          () => undefined,
+        );
+    const next = storeWrites.then(raw, raw);
+    storeWrites = next;
+
     return new Promise<void>((resolve) => {
       let timer: ReturnType<typeof setTimeout> | undefined = setTimeout(() => {
         timer = undefined;
-        // The write is still queued and will still run in order; this caller
-        // simply stops waiting for it.
+        warnStoreTimeout(label);
+        // The write is still queued and still ordered; this caller simply stops
+        // watching it, which is all a supplementary cache is owed.
         resolve();
       }, storeTimeoutMs);
       // Delivers this caller's answer rather than guarding other work, so it is
       // deliberately not unref'd — see the note on runStoreOp's timer.
-      void settled.then(() => {
+      void next.then(() => {
         if (timer !== undefined) {
           clearTimeout(timer);
           timer = undefined;
@@ -445,6 +458,7 @@ export function wrapOAuthClientProvider(
       });
     });
   }
+
   /** Bajo-7: wall-clock ms until which refresh attempts are suppressed after a definitive failure. */
   let refreshBlockedUntil = 0;
   /** The sanitized cause of the definitive failure that opened the current suppression window. */
@@ -610,6 +624,14 @@ export function wrapOAuthClientProvider(
    * `fallback`; the operation itself keeps running, since `ExpiryStore` has no
    * cancellation contract.
    */
+  function warnStoreTimeout(label: string): void {
+    if (warnedStoreTimeout) return;
+    warnedStoreTimeout = true;
+    onWarning(
+      `[mcp-auth-kit] expiryStore.${label}("${sanitizeForMessage(resourceKey)}") exceeded storeTimeoutMs (${storeTimeoutMs}ms); continuing without it. The expiry store is a cache, never the source of truth.`,
+    );
+  }
+
   async function runStoreOp<T>(
     label: string,
     op: () => Promise<T>,
@@ -641,12 +663,7 @@ export function wrapOAuthClientProvider(
         }),
       ]);
       if (outcome === timedOut) {
-        if (!warnedStoreTimeout) {
-          warnedStoreTimeout = true;
-          onWarning(
-            `[mcp-auth-kit] expiryStore.${label}("${sanitizeForMessage(resourceKey)}") exceeded storeTimeoutMs (${storeTimeoutMs}ms); continuing without it. The expiry store is a cache, never the source of truth.`,
-          );
-        }
+        warnStoreTimeout(label);
         return fallback;
       }
       return outcome;
@@ -681,6 +698,14 @@ export function wrapOAuthClientProvider(
     const existing = await provider.clientInformation();
     if (existing) return existing;
     if (!registrationOptions) return undefined;
+
+    // MEDIO-1: counted BEFORE the registration round trip starts. The queue
+    // cannot order this write against a revocation that happened DURING the
+    // round trip, because this write only takes its turn once the HTTP call
+    // returns — by which time the revocation's own queued pass has long
+    // drained. So the ordering guarantee has to be re-established explicitly,
+    // and this is the observation it rests on.
+    const invalidationsAtEntry = invalidationCount;
 
     let registered: OAuthClientInformationFull;
     try {
@@ -729,7 +754,41 @@ export function wrapOAuthClientProvider(
     // with the same `client_id` the server just refused instead of registering
     // anew. `provider.saveClientInformation` is guaranteed to exist: checked at
     // wrap time above.
-    await serializeCredentialMutation(() => provider.saveClientInformation!(stamped));
+    //
+    // MEDIO-1: persist-and-re-revoke. If a revocation landed while the
+    // registration was in flight, this client was minted at the authorization
+    // server during a logout. Skipping the write would leave it orphaned there
+    // — registered remotely, invisible locally, impossible to clean up — so it
+    // is persisted either way, and the revocation is then re-applied to it.
+    //
+    // Both happen in ONE queue turn. Splitting them into two would open a
+    // window in which the freshly minted `client_secret` is readable from the
+    // provider's storage after a logout the caller was already told had
+    // completed; inside a single turn no other credential mutation of this
+    // wrapper can interleave, so the revoked state is restored before anything
+    // else can observe otherwise. The window is therefore no wider than the
+    // ordinary revocation path's own.
+    await serializeCredentialMutation(async () => {
+      await provider.saveClientInformation!(stamped);
+      if (invalidationsAtEntry === invalidationCount) return;
+      if (!provider.invalidateCredentials) return;
+      // 'client' rather than 'all': the revocation that raced this has already
+      // dealt with the tokens, and re-revoking those would discard credentials
+      // that a legitimate login may have established since.
+      await provider.invalidateCredentials('client');
+    });
+
+    if (invalidationsAtEntry !== invalidationCount) {
+      // The caller asked who the client is; the honest answer after a logout
+      // that overlapped the registration is "there isn't one" — returning the
+      // stamped client would hand out a `client_secret` that no longer exists
+      // in storage, and the SDK would then try to use it.
+      throw new McpAuthKitError(
+        'client_registration',
+        'Client registration completed, but the credentials were invalidated while it was in flight, so the new client was revoked again rather than left in place',
+        'this is a benign race against invalidateCredentials(), not a registration failure — retry the operation and a fresh client will be registered if one is still needed',
+      );
+    }
     return stamped;
   }
 
@@ -1333,9 +1392,7 @@ export function wrapOAuthClientProvider(
       // BAJO-1: ordered against this instance's other store writes, and
       // tracked so invalidateCredentials() can wait for all of them rather
       // than only the newest.
-      await queueStoreWrite(() =>
-        runStoreOp('set', () => expiryStore.set(resourceKey, newExpiresAt), undefined),
-      );
+      await queueStoreWrite('set', () => expiryStore.set(resourceKey, newExpiresAt));
     }
   }
 
@@ -1364,10 +1421,20 @@ export function wrapOAuthClientProvider(
   }
   if (provider.saveClientInformation) {
     // MEDIO-A: same queue as every other credential write — see the note in
-    // the auto-registration path. This is the pass-through the SDK's own
-    // bindClientInformation() uses (auth.js:289), which re-saves the stored
-    // client info on every auth() run, so it is the likeliest writer to
-    // overlap a concurrent revocation.
+    // the auto-registration path. The SDK's own bindClientInformation()
+    // (auth.js:286-295 in 1.31.0) writes through here, but ONLY when the stored
+    // client information has no `issuer` stamp — not on every auth() run, as an
+    // earlier version of this comment claimed. Both the SDK and this package's
+    // registration path always stamp, so in practice that writer only appears
+    // for legacy storage written before stamping existed.
+    //
+    // There is deliberately NO invalidation guard here, unlike saveTokens().
+    // This is an explicit, caller-initiated write, so last call wins: a
+    // saveClientInformation() issued after a revocation is the caller saying
+    // "store this", and second-guessing it would make an unwrapped provider and
+    // a wrapped one disagree about a plain setter. What the queue guarantees is
+    // ordering — this write cannot overtake a revocation that was requested
+    // first. Choosing what to write after a logout is the caller's business.
     wrapped.saveClientInformation = (info) =>
       serializeCredentialMutation(() => provider.saveClientInformation!(info));
   }
@@ -1486,15 +1553,8 @@ export function wrapOAuthClientProvider(
         // than leaving the stale (still-valid-looking) value. Queued like every
         // other store write, so it is ordered after them rather than racing
         // whatever was already on its way.
-        await queueStoreWrite(() =>
-          runStoreOp(
-            expiryStore.delete ? 'delete' : 'set',
-            () =>
-              expiryStore.delete
-                ? expiryStore.delete(resourceKey)
-                : expiryStore.set(resourceKey, 0),
-            undefined,
-          ),
+        await queueStoreWrite(expiryStore.delete ? 'delete' : 'set', () =>
+          expiryStore.delete ? expiryStore.delete(resourceKey) : expiryStore.set(resourceKey, 0),
         );
       }
     };

@@ -56,6 +56,18 @@ export function withTimeout(fetchFn: FetchLike | undefined, timeoutMs: number): 
       }
     }
 
+    // BAJO-5: refuse before delegating if the request is already cancelled.
+    // Node's own fetch rejects on an aborted signal, so with a conforming
+    // implementation this changes nothing — but `base` is caller-supplied, and
+    // the non-conforming shape the cleanup above already anticipates (one that
+    // ignores the signal) would otherwise put the request on the wire after it
+    // was cancelled. On the refresh path that means emitting a `refresh_token`
+    // belonging to credentials the user has just revoked.
+    if (controller.signal.aborted) {
+      cleanup();
+      throw new DOMException('The operation was aborted', 'AbortError');
+    }
+
     try {
       return await base(url, { ...init, signal: controller.signal });
     } finally {

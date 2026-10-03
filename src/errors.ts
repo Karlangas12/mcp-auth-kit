@@ -4,7 +4,6 @@
 export type McpAuthKitErrorPhase =
   | 'token_refresh'
   | 'client_registration'
-  | 'resource_validation'
   | 'authorization';
 
 /**
