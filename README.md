@@ -417,11 +417,23 @@ implementations look like. If your provider implements
 
 ## What the wrapper requires of your provider
 
-One rule, and it is the only one: **a credential write must not call back into
-the wrapper.** Inside your `saveTokens`, `saveClientInformation` or
-`invalidateCredentials`, do not call `wrapped.saveTokens()` or
-`wrapped.invalidateCredentials()` on the same instance — call whatever you need
-directly instead.
+**Rule 1: a credential write must not call back into the wrapper.** Inside your
+`saveTokens`, `saveClientInformation` or `invalidateCredentials`, do not call
+`wrapped.saveTokens()` or `wrapped.invalidateCredentials()` on the same
+instance — call whatever you need directly instead.
+
+**Rule 2: `invalidateCredentials` must be idempotent, because it is called more
+than once per request.** A `wrapped.invalidateCredentials(scope)` for a scope
+that touches credentials (`'all'`, `'client'`, `'tokens'`) calls yours
+**twice**: once immediately, so a revocation is never delayed by anything, and
+once more queued behind any credential write already in flight, so a write that
+started earlier cannot be the last word. (`'verifier'` and `'discovery'` are
+passed through once — this wrapper holds no state of theirs to order against.)
+Separately, if a revocation lands while auto-registration is mid-flight, your
+provider also receives an `invalidateCredentials('client')` it did not request,
+to revoke the client that was just minted. So a provider that posts to a remote
+revocation endpoint, counts calls, or throws when there is nothing left to
+revoke needs to tolerate repeats.
 
 The reason is that mcp-auth-kit applies credential writes in call order rather
 than in I/O-completion order. Without that, a `saveTokens()` already in flight
@@ -596,7 +608,16 @@ liability:
   via `expiryStore.delete()` if the store implements it, or overwrites it
   with a sentinel (`expiresAt = 0`, i.e. "already expired") if it doesn't —
   either way, a revoked credential doesn't leave a stale, still-valid-looking
-  expiry behind.
+  expiry behind, *provided the store eventually answers*. One caveat, stated
+  because it is the one case where it doesn't hold: store writes are applied in
+  a serialized chain so they can never be reordered, which means a write that
+  never settles at all stalls that chain for the life of the process — and the
+  revocation's own delete is behind it, so a pre-existing entry survives the
+  logout indefinitely. Callers are never stalled by this (each waits at most
+  `storeTimeoutMs`), and the stranded entry is inert once the wrapped provider
+  has dropped its tokens, since `tokens()` only consults an expiry when there
+  are stored tokens to judge. It is the deliberate price of never reordering:
+  bounding the chain instead was tried and reintroduced the reordering.
 
 - **Every store operation is bounded** by `storeTimeoutMs` (default 5000). The
   store is a cache, never the source of truth, so it must never be able to
@@ -625,8 +646,14 @@ actually apply each operation, and `invalidateCredentials()`'s own delete is
 enqueued behind whatever was already issued — so an expiry write cannot land
 after the revocation that followed it, however slow the store is. What
 `storeTimeoutMs` bounds is how long a *caller* waits to be told the write
-finished, not the ordering: a slow store delays the chain, never reorders it,
-and never delays a credential write, a revocation or a read.
+finished, not the ordering: a slow store delays the chain but never reorders it.
+
+To be precise about what that costs a caller, since it is not nothing:
+`saveTokens()` and `invalidateCredentials()` each wait up to `storeTimeoutMs`
+for their own store write, once — not once per queued write. A revocation
+reaches your provider *immediately* either way, before any of this, so a slow
+store never delays the revocation itself, only the return of the call that
+requested it. `tokens()` never queues behind a store write at all.
 
 What cannot be closed in-process is **two processes racing on one shared
 store**: if process A is mid-`saveTokens()` while process B revokes, A's expiry

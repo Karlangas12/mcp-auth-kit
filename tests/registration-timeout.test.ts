@@ -1,7 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 import { wrapOAuthClientProvider } from '../src/index.js';
 import { isRetryableRegistrationError, isRetryableOAuthError } from '../src/classifyError.js';
-import { InMemoryProvider, errorResponse, jsonResponse, testClientMetadata } from './helpers.js';
+import {
+  InMemoryProvider,
+  errorResponse,
+  jsonResponse,
+  routeDiscovery,
+  testClientMetadata,
+} from './helpers.js';
 
 // A6 (round 3): RFC 7591 dynamic client registration is a NON-IDEMPOTENT POST.
 // When mcp-auth-kit's own `timeoutMs` aborts it, the authorization server may
@@ -31,7 +37,7 @@ describe('A6: a dynamic client registration aborted by our own timeout is NOT re
 
     const wrapped = wrapOAuthClientProvider(inner, {
       authorizationServerUrl: 'https://auth.example.com',
-      fetchFn: fetchFn as unknown as typeof fetch,
+      fetchFn: routeDiscovery(fetchFn as never) as unknown as typeof fetch,
       timeoutMs: 20, // real timers, kept tiny
       registration: { maxAttempts: 5, baseDelayMs: 1, sleep: () => Promise.resolve() },
     });
@@ -56,7 +62,7 @@ describe('A6: a dynamic client registration aborted by our own timeout is NOT re
     const inner = new InMemoryProvider(testClientMetadata);
     const wrapped = wrapOAuthClientProvider(inner, {
       authorizationServerUrl: 'https://auth.example.com',
-      fetchFn: fetchFn as unknown as typeof fetch,
+      fetchFn: routeDiscovery(fetchFn as never) as unknown as typeof fetch,
       registration: { maxAttempts: 5, baseDelayMs: 1, sleep: () => Promise.resolve() },
     });
 

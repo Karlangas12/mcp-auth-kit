@@ -230,3 +230,43 @@ export function createMockAuthServer(config: MockServerConfig) {
 
   return { fetchFn, calls };
 }
+
+/**
+ * BAJO-6: auto-registration now discovers the authorization server's real
+ * `registration_endpoint` before posting, so a bare `fetchFn` sees a discovery
+ * GET before the registration POST.
+ *
+ * This wraps a registration-only fetch so discovery is answered separately and
+ * the caller's own spy counts registration attempts alone — which is what those
+ * assertions were always about. It also makes the tests prove we post to the
+ * ADVERTISED endpoint rather than a guessed one: the metadata deliberately puts
+ * registration somewhere `new URL('/register', …)` would never find.
+ */
+export const advertisedRegistrationEndpoint = 'https://auth.example.com/oauth2/v2/register';
+
+export function routeDiscovery(
+  registrationFetch: (url: string | URL, init?: RequestInit) => Promise<Response>,
+  options: { registrationEndpoint?: string | null } = {},
+): (url: string | URL, init?: RequestInit) => Promise<Response> {
+  const endpoint =
+    options.registrationEndpoint === undefined
+      ? advertisedRegistrationEndpoint
+      : options.registrationEndpoint;
+  return async (url, init) => {
+    const href = String(url);
+    if (href.includes('/.well-known/')) {
+      if (endpoint === null) {
+        // A server with no metadata document at all.
+        return new Response('not found', { status: 404 });
+      }
+      return jsonResponse({
+        issuer: 'https://auth.example.com',
+        authorization_endpoint: 'https://auth.example.com/authorize',
+        token_endpoint: 'https://auth.example.com/token',
+        registration_endpoint: endpoint,
+        response_types_supported: ['code'],
+      });
+    }
+    return registrationFetch(url, init);
+  };
+}

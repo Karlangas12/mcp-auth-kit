@@ -62,10 +62,29 @@ function registeringProvider(saveClientDelayMs = 0) {
   };
 }
 
-/** A registration endpoint that answers after `latencyMs`. */
+/**
+ * A registration endpoint that answers after `latencyMs`, behind the metadata
+ * discovery that auto-registration now performs first (BAJO-6). Only the POST
+ * is counted and delayed — discovery is immediate, so the window the tests aim
+ * at is the registration round trip itself.
+ */
 function slowRegistrationEndpoint(latencyMs: number) {
   let calls = 0;
-  const fetchFn = () => {
+  const fetchFn = (url: string | URL) => {
+    if (String(url).includes('/.well-known/')) {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            issuer: AS,
+            authorization_endpoint: `${AS}/authorize`,
+            token_endpoint: `${AS}/token`,
+            registration_endpoint: `${AS}/oauth2/register`,
+            response_types_supported: ['code'],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      );
+    }
     calls += 1;
     return new Promise<Response>((resolve) =>
       setTimeout(
@@ -194,9 +213,14 @@ describe('MEDIO-1: a revocation during the registration round trip', () => {
   });
 
   it('a revocation scoped to tokens only does not re-revoke the client', async () => {
-    // invalidationCount tracks token-affecting scopes, which is what a
-    // registration race must react to; but the re-revoke itself is scoped to
-    // 'client' so it cannot discard tokens a legitimate login established since.
+    // MEDIO-2. This test's NAME was always right and its body asserted the
+    // opposite: it required the client to be deleted by a revocation that never
+    // asked about the client. That is what a single two-scope counter bought —
+    // a 'tokens' logout destroying a brand-new registration, which orphaned the
+    // client at the authorization server, produced a duplicate registration on
+    // the next run, and hard-failed the in-flight auth().
+    //
+    // A 'tokens' revocation clears tokens. The client it never mentioned stays.
     const p = registeringProvider();
     const endpoint = slowRegistrationEndpoint(150);
     const wrapped = wrapOAuthClientProvider(p.api as never, {
@@ -205,13 +229,77 @@ describe('MEDIO-1: a revocation during the registration round trip', () => {
       registration: { maxAttempts: 1 },
     });
 
-    void wrapped.clientInformation().catch(() => undefined);
+    const registering = wrapped.clientInformation();
     await sleep(40);
     await wrapped.invalidateCredentials!('tokens');
-    await sleep(300);
 
-    expect(p.log.at(-1)).toBe('invalidate:client');
+    // The registration completes normally and is returned to the caller.
+    const info = await registering;
+    expect((info as { client_id?: string })?.client_id).toBe('NEW-CLIENT');
+    await sleep(100);
+
+    expect(p.log).toEqual([
+      'invalidate:tokens',
+      'invalidate:tokens',
+      'saveClientInformation:NEW-CLIENT',
+    ]);
+    expect((p.client() as { client_secret?: string })?.client_secret).toBe('s3cret');
+    // And the tokens the revocation DID ask about are gone.
+    expect(p.tokens()).toBeUndefined();
+  });
+
+  it("a revocation scoped to 'client' DOES re-revoke — the scope the old counter ignored", async () => {
+    // MEDIO-1. 'client' is the scope whose entire subject is client
+    // credentials, and it was the one the guard did not track at all — so the
+    // minted client_secret was persisted and returned after a completed
+    // client-scoped logout.
+    const p = registeringProvider();
+    const endpoint = slowRegistrationEndpoint(150);
+    const wrapped = wrapOAuthClientProvider(p.api as never, {
+      authorizationServerUrl: AS,
+      fetchFn: endpoint.fetchFn as unknown as typeof fetch,
+      registration: { maxAttempts: 1 },
+    });
+
+    const registering = wrapped.clientInformation().catch((e: Error) => e);
+    await sleep(40);
+    await wrapped.invalidateCredentials!('client');
+    const outcome = await registering;
+    await sleep(100);
+
     expect(p.client()).toBeUndefined();
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toContain('invalidated while it was in flight');
+    expect(p.log.at(-1)).toBe('invalidate:client');
+  });
+
+  it("'verifier' and 'discovery' are orthogonal: one pass-through, no client deletion", async () => {
+    // Neither scope can clear a token or a client registration, and this
+    // wrapper stores no verifier and no discovery state — so they must not
+    // register with either guard, and there is nothing of ours to order
+    // against, hence a single provider call rather than the queued pair.
+    const p = registeringProvider();
+    const endpoint = slowRegistrationEndpoint(150);
+    const wrapped = wrapOAuthClientProvider(p.api as never, {
+      authorizationServerUrl: AS,
+      fetchFn: endpoint.fetchFn as unknown as typeof fetch,
+      registration: { maxAttempts: 1 },
+    });
+
+    const registering = wrapped.clientInformation();
+    await sleep(40);
+    await wrapped.invalidateCredentials!('verifier');
+    await wrapped.invalidateCredentials!('discovery');
+    const info = await registering;
+    await sleep(100);
+
+    expect((info as { client_id?: string })?.client_id).toBe('NEW-CLIENT');
+    expect((p.client() as { client_secret?: string })?.client_secret).toBe('s3cret');
+    expect(p.log).toEqual([
+      'invalidate:verifier',
+      'invalidate:discovery',
+      'saveClientInformation:NEW-CLIENT',
+    ]);
   });
 });
 
@@ -307,5 +395,44 @@ describe('MEDIO-2: ordering holds for a store slower than storeTimeoutMs', () =>
     // Degradation must be visible, and said once rather than on every write.
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain('exceeded storeTimeoutMs');
+  });
+});
+
+describe('BAJO-1: a failed re-revoke says so instead of claiming the client was revoked', () => {
+  it('reports the client as still stored, with the package error type', async () => {
+    const p = registeringProvider();
+    const endpoint = slowRegistrationEndpoint(150);
+    // A provider whose client-scoped revocation fails — a locked keychain, a
+    // read-only file, a revocation endpoint that 500s.
+    p.api.invalidateCredentials = async (scope: string) => {
+      p.log.push(`invalidate:${scope}`);
+      if (scope === 'client') throw new Error('keychain exploded');
+      if (scope === 'all' || scope === 'tokens') {
+        // tokens cleared as usual
+      }
+    };
+
+    const wrapped = wrapOAuthClientProvider(p.api as never, {
+      authorizationServerUrl: AS,
+      fetchFn: endpoint.fetchFn as unknown as typeof fetch,
+      registration: { maxAttempts: 1 },
+    });
+
+    const registering = wrapped.clientInformation().catch((e: Error) => e);
+    await sleep(40);
+    await wrapped.invalidateCredentials!('client').catch(() => undefined);
+    const outcome = await registering;
+    await sleep(60);
+
+    // The raw provider error used to escape untyped, and the message said the
+    // client "was revoked again rather than left in place" — while the secret
+    // was in fact still in storage.
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).name).toBe('McpAuthKitError');
+    expect((outcome as Error).message).toMatch(/FAILED/);
+    expect((outcome as Error).message).toMatch(/still stored/);
+    expect((outcome as { cause?: unknown }).cause).toBeInstanceOf(Error);
+    // And the claim matches reality: it really is still there.
+    expect((p.client() as { client_secret?: string })?.client_secret).toBe('s3cret');
   });
 });

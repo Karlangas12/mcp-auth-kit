@@ -1,4 +1,5 @@
 import {
+  discoverAuthorizationServerMetadata,
   registerClient,
   refreshAuthorization,
   type OAuthClientProvider,
@@ -378,6 +379,8 @@ export function wrapOAuthClientProvider(
     for (const registration of active) registration.abort();
     abortPendingSalvages();
   }
+  /** MEDIO-3: whether we've already warned about an unrefreshable expired token. */
+  let warnedExpiredWithoutRefreshToken = false;
   /** Whether we've already warned about an invalid expiryStore value this process. */
   let warnedInvalidExpiryValue = false;
   /** Whether we've already warned about an expiryStore operation timing out this process. */
@@ -596,19 +599,32 @@ export function wrapOAuthClientProvider(
   }
 
   /**
-   * BAJO-D: bumped once per `invalidateCredentials()` call, synchronously, at
-   * call time — the moment the revocation becomes authoritative.
+   * MEDIO-1 / MEDIO-2: one counter PER CONCERN, bumped synchronously at call
+   * time — the moment the revocation becomes authoritative.
    *
-   * The generation counter alone cannot carry this. It moves for two different
-   * reasons, and a save that finds it has moved must react to them oppositely:
-   * an invalidation means "bail, your tokens are revoked", while an earlier
-   * save means "you are the newer write, commit". Since the queue guarantees an
-   * earlier save completed before this one started, conflating the two made the
-   * later save skip its own expiry commit and leave storage holding ITS tokens
-   * under the EARLIER save's expiry. This counter is the discriminator: it moves
-   * only for revocations.
+   * A single counter governed both guards and was wrong in both directions. The
+   * SDK's scope union is `'all' | 'client' | 'tokens' | 'verifier' | 'discovery'`
+   * (auth.d.ts:116), and counting only `'all'`/`'tokens'` meant a
+   * `'client'`-scoped revocation — the one whose entire subject IS client
+   * credentials — did not register with the client guard at all, while a
+   * `'tokens'`-scoped one wrongly triggered it and deleted client information
+   * the caller never asked about.
+   *
+   * The generation counter cannot carry either of these on its own. It moves for
+   * two different reasons, and a save that finds it has moved must react to them
+   * oppositely: an invalidation means "bail, your tokens are revoked", while an
+   * earlier save means "you are the newer write, commit". These counters move
+   * only for revocations, and only for the concern they name.
+   *
+   * `'verifier'` and `'discovery'` are deliberately in NEITHER. Both are
+   * delegated straight through — this wrapper stores no PKCE verifier and no
+   * discovery state, and neither scope can clear a token or a client
+   * registration — so they are orthogonal to both guards. Mapping them onto
+   * either one would make an unrelated revocation discard credentials, which is
+   * precisely the MEDIO-2 mistake.
    */
-  let invalidationCount = 0;
+  let tokenInvalidations = 0;
+  let clientInvalidations = 0;
 
   function beginGeneration(reason: 'save' | 'invalidate'): number {
     expiryGeneration += 1;
@@ -705,14 +721,63 @@ export function wrapOAuthClientProvider(
     // returns — by which time the revocation's own queued pass has long
     // drained. So the ordering guarantee has to be re-established explicitly,
     // and this is the observation it rests on.
-    const invalidationsAtEntry = invalidationCount;
+    //
+    // It is the CLIENT counter, not the token one. This write is client
+    // information; only a revocation that clears client information
+    // ('all' or 'client') makes it stale. Keying off the token counter was
+    // wrong twice over: a 'client'-scoped logout did not register at all, and a
+    // 'tokens'-scoped one wrongly triggered a client deletion the caller never
+    // asked for.
+    const clientInvalidationsAtEntry = clientInvalidations;
+
+    // BAJO-6: discover where the authorization server actually accepts
+    // registrations, instead of guessing.
+    //
+    // `registerClient` only honours `metadata.registration_endpoint` when a
+    // `metadata` document is passed; without one it falls back to
+    // `new URL('/register', authorizationServerUrl)` (SDK auth.js:993-1003).
+    // That fallback discards any path in the configured URL — so
+    // `https://login.example.com/tenantX` became
+    // `https://login.example.com/register` — and ignores whatever the server
+    // advertises. Against an authorization server whose registration endpoint
+    // is anywhere else, registration 404'd, the 404 classified as transient and
+    // was retried, and the caller was then told to "verify the authorization
+    // server advertises a registration_endpoint" — which it did, and which this
+    // package never read. auth()'s own DCR has always passed `metadata`
+    // (auth.js:315-320); this path simply did not.
+    //
+    // Discovery failing is not fatal: fall back to the previous behaviour so a
+    // server with no metadata document but a conventional /register endpoint
+    // keeps working. `fetchFn` is the timeout-wrapped one, so this cannot hang.
+    let metadata: Awaited<ReturnType<typeof discoverAuthorizationServerMetadata>>;
+    try {
+      metadata = await discoverAuthorizationServerMetadata(authorizationServerUrl, { fetchFn });
+    } catch {
+      metadata = undefined;
+    }
+    if (metadata && !metadata.registration_endpoint) {
+      // Discovery succeeded and the server states it does not support DCR.
+      // Saying so beats POSTing to a guessed URL and reporting its 404.
+      throw new McpAuthKitError(
+        'client_registration',
+        `The authorization server at ${configuredIssuer} does not advertise a registration_endpoint, so it does not support RFC 7591 dynamic client registration`,
+        "pre-register a client with this authorization server and return it from the wrapped provider's clientInformation() instead of relying on the `registration` option",
+      );
+    }
 
     let registered: OAuthClientInformationFull;
     try {
       registered = await withExponentialBackoff(
         () =>
           registerClient(authorizationServerUrl, {
+            metadata,
             clientMetadata: provider.clientMetadata,
+            // Passed explicitly rather than left to the body spread, so the
+            // intent is visible: this path has no protected-resource metadata
+            // to resolve a SEP-835 scope from (that negotiation belongs to
+            // auth(), which has the server URL), so the client's own declared
+            // scope is the correct and only answer here.
+            scope: provider.clientMetadata.scope,
             fetchFn,
           }),
         // A6: registration-specific policy — an aborted (timed-out)
@@ -755,11 +820,12 @@ export function wrapOAuthClientProvider(
     // anew. `provider.saveClientInformation` is guaranteed to exist: checked at
     // wrap time above.
     //
-    // MEDIO-1: persist-and-re-revoke. If a revocation landed while the
-    // registration was in flight, this client was minted at the authorization
-    // server during a logout. Skipping the write would leave it orphaned there
-    // — registered remotely, invisible locally, impossible to clean up — so it
-    // is persisted either way, and the revocation is then re-applied to it.
+    // MEDIO-1: persist-and-re-revoke. If a revocation that clears client
+    // information landed while the registration was in flight, this client was
+    // minted at the authorization server during a logout. Skipping the write
+    // would leave it orphaned there — registered remotely, invisible locally,
+    // impossible to clean up — so it is persisted either way, and the
+    // revocation is then re-applied to it.
     //
     // Both happen in ONE queue turn. Splitting them into two would open a
     // window in which the freshly minted `client_secret` is readable from the
@@ -768,24 +834,49 @@ export function wrapOAuthClientProvider(
     // wrapper can interleave, so the revoked state is restored before anything
     // else can observe otherwise. The window is therefore no wider than the
     // ordinary revocation path's own.
+    //
+    // MEDIO-2: a 'tokens'-scoped revocation does NOT reach here. It never
+    // touched client information, so there is nothing to re-apply to this
+    // client — and re-revoking anyway deleted a brand-new registration, which
+    // caused the remote orphan this path exists to prevent, produced duplicate
+    // registrations on the next run, and hard-failed the in-flight auth().
+    let reRevoked = false;
+    let reRevokeFailure: unknown;
     await serializeCredentialMutation(async () => {
       await provider.saveClientInformation!(stamped);
-      if (invalidationsAtEntry === invalidationCount) return;
-      if (!provider.invalidateCredentials) return;
-      // 'client' rather than 'all': the revocation that raced this has already
-      // dealt with the tokens, and re-revoking those would discard credentials
-      // that a legitimate login may have established since.
-      await provider.invalidateCredentials('client');
+      if (clientInvalidationsAtEntry === clientInvalidations) return;
+      try {
+        // Scoped to 'client': the racing revocation already applied its own
+        // scope to everything else, and widening this to 'all' would discard
+        // tokens a legitimate login may have established since.
+        await provider.invalidateCredentials!('client');
+        reRevoked = true;
+      } catch (error) {
+        // BAJO-1: the message must not claim a revocation that did not happen.
+        // Letting the provider's raw error escape was wrong twice: it left the
+        // package's own error contract, and it said nothing about the
+        // `client_secret` still sitting in storage after a completed logout.
+        reRevokeFailure = sanitizedCause(error);
+      }
     });
 
-    if (invalidationsAtEntry !== invalidationCount) {
+    if (reRevokeFailure !== undefined) {
+      throw new McpAuthKitError(
+        'client_registration',
+        'Client registration completed during an invalidateCredentials() call, and the attempt to revoke the newly registered client again FAILED — the new client information is still stored',
+        'the stored client was registered at the authorization server and could not be removed locally; call invalidateCredentials("client") again, and revoke the client at the authorization server if it persists them',
+        reRevokeFailure,
+      );
+    }
+
+    if (reRevoked) {
       // The caller asked who the client is; the honest answer after a logout
       // that overlapped the registration is "there isn't one" — returning the
       // stamped client would hand out a `client_secret` that no longer exists
       // in storage, and the SDK would then try to use it.
       throw new McpAuthKitError(
         'client_registration',
-        'Client registration completed, but the credentials were invalidated while it was in flight, so the new client was revoked again rather than left in place',
+        'Client registration completed, but the client credentials were invalidated while it was in flight, so the new client was revoked again rather than left in place',
         'this is a benign race against invalidateCredentials(), not a registration failure — retry the operation and a fresh client will be registered if one is still needed',
       );
     }
@@ -846,11 +937,35 @@ export function wrapOAuthClientProvider(
     if (!needsRefresh) return stored;
 
     if (!stored.refresh_token) {
-      throw new McpAuthKitError(
-        'token_refresh',
-        'Access token has expired and no refresh_token is available',
-        'the user must complete the OAuth authorization code flow again; the authorization server did not issue a refresh_token, or it was not persisted',
-      );
+      // MEDIO-3: hand the expired token back rather than throwing.
+      //
+      // Throwing here looked like the "typed, actionable error instead of
+      // silent failure" this package exists to provide, and it was exactly
+      // backwards. `auth()` calls provider.tokens() BEFORE its own refresh
+      // logic (SDK auth.js:341), and `McpAuthKitError` is deliberately not one
+      // of the three classes it recovers from — so the throw aborted the whole
+      // auth() run, and the full re-authorization redirect that an UNWRAPPED
+      // provider gets in exactly this situation never happened. It is worse at
+      // the transport layer: StreamableHTTPClientTransport._commonHeaders
+      // awaits tokens() with no catch, so every request rejected and even the
+      // reactive 401 path that would have re-run auth() never ran.
+      //
+      // An expired access token with no refresh_token is not an error state
+      // this wrapper can improve on. It is the ordinary "time to re-authorize"
+      // state, and the SDK already handles it by redirecting. Returning the
+      // token keeps that path intact and makes this wrapper a drop-in
+      // replacement here, which it was not.
+      //
+      // Warned rather than silent, so the condition is still visible to an
+      // operator reading logs — that was the legitimate half of the original
+      // intent.
+      if (!warnedExpiredWithoutRefreshToken) {
+        warnedExpiredWithoutRefreshToken = true;
+        onWarning(
+          '[mcp-auth-kit] The access token has expired and no refresh_token is stored, so it cannot be refreshed. Returning it as-is and leaving re-authorization to the SDK, which redirects the user through the authorization code flow. The authorization server did not issue a refresh_token, or it was not persisted.',
+        );
+      }
+      return stored;
     }
 
     return refreshNow(stored, generation);
@@ -1300,7 +1415,7 @@ export function wrapOAuthClientProvider(
     // BAJO-D: revocations are counted at CALL time, so this captures every
     // invalidation that arrives from here on — whether while this save waits
     // for its turn or while its write is in flight.
-    const invalidationsAtEntry = invalidationCount;
+    const invalidationsAtEntry = tokenInvalidations;
     // BAJO-D: the generation is captured when this save ACQUIRES ITS TURN, not
     // at the call site. Captured at the call site, two saves enqueued before
     // either had written shared one starting generation, and the second one
@@ -1360,7 +1475,7 @@ export function wrapOAuthClientProvider(
     // The two conditions are not redundant. The counter catches a revocation,
     // which is the case that must bail; the generation catches anything else
     // that made this write non-current by the time it landed.
-    if (invalidationsAtEntry !== invalidationCount) return;
+    if (invalidationsAtEntry !== tokenInvalidations) return;
     if (generationAtTurn !== expiryGeneration) return;
     const ttlMs =
       newTokens.expires_in !== undefined
@@ -1452,7 +1567,16 @@ export function wrapOAuthClientProvider(
   }
   if (provider.invalidateCredentials) {
     wrapped.invalidateCredentials = async (scope) => {
-      const tracked = scope === 'all' || scope === 'tokens';
+      // Which concerns this scope actually clears, per the SDK's union.
+      const clearsTokens = scope === 'all' || scope === 'tokens';
+      const clearsClient = scope === 'all' || scope === 'client';
+      // 'verifier' and 'discovery' clear neither: they are passed through once,
+      // with no queued ordering pass, because this wrapper holds no state of
+      // theirs to order against.
+      const clearsCredentials = clearsTokens || clearsClient;
+      const tracked = clearsTokens;
+
+      if (clearsClient) clientInvalidations += 1;
 
       // Everything that must be true the instant this call is made happens
       // here, synchronously, before any await: a concurrent saveTokens() whose
@@ -1463,7 +1587,7 @@ export function wrapOAuthClientProvider(
         // BAJO-D: counted at call time. This is what tells a landing save
         // "a revocation happened, bail" as distinct from "an earlier save
         // moved the generation, you are the newer write, commit".
-        invalidationCount += 1;
+        tokenInvalidations += 1;
         // Start a new generation: anything still in flight from the previous
         // one (a cold store read, a refresh) now describes credentials that no
         // longer exist, and commitExpiryState will drop whatever it tries to
@@ -1507,6 +1631,13 @@ export function wrapOAuthClientProvider(
       // guarantee ("the credentials are gone now") is already satisfied by the
       // immediate call above. It is also what keeps a reentrant invalidation
       // from inside a provider write structurally deadlock-free (BAJO-C).
+      if (!clearsCredentials) {
+        // Nothing of ours to order against, and no reason to call the provider
+        // twice for it.
+        await provider.invalidateCredentials!(scope);
+        return;
+      }
+
       const revokeNow = provider.invalidateCredentials!(scope);
       const revokeInOrder = serializeCredentialMutation(
         () => provider.invalidateCredentials!(scope),
