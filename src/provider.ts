@@ -1284,7 +1284,7 @@ export function wrapOAuthClientProvider(
       throw new McpAuthKitError(
         'token_refresh',
         'Cannot refresh the access token because no client information is registered',
-        'call clientInformation()/register the client before tokens() is used, or configure the `registration` option so mcp-auth-kit can register automatically',
+        'call clientInformation() to register the client before tokens() is used. Note that the `registration` option cannot rescue this path: a newly registered client cannot redeem a refresh_token issued to a different one, so this refresh has to fail even with auto-registration configured',
       );
     }
 
