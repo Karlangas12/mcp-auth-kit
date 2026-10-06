@@ -1,6 +1,6 @@
 {
   "name": "@karlangas12/mcp-auth-kit",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "module",
   "description": "Drop-in OAuthClientProvider wrapper for @modelcontextprotocol/sdk that fixes proactive token refresh, dynamic client registration retry, and trailing-slash resource normalization bugs seen across real MCP clients.",
   "license": "MIT",
@@ -40,14 +40,15 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "scripts": {
     "build": "tsup src/index.ts --format esm --dts --clean",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "peerDependencies": {
     "@modelcontextprotocol/sdk": "^1.31.0"

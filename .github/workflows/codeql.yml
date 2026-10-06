@@ -1,0 +1,31 @@
+# Análisis estático de seguridad con CodeQL sobre el código TypeScript/JavaScript.
+# Se ejecuta en cada push y PR a master, y una vez por semana.
+name: CodeQL
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    # Lunes a las 06:00 UTC.
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: analyze
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Inicializar CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+
+      - name: Analizar
+        uses: github/codeql-action/analyze@v3

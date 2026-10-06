@@ -1,0 +1,42 @@
+# Puerta de calidad: se ejecuta en cada push y PR contra master.
+# Comprueba tipos, tests y build en las versiones de Node que el paquete soporta
+# (engines: >=20). Node 18 queda fuera a propósito: está en EOL.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Comprobar tipos
+        run: npm run typecheck
+
+      - name: Ejecutar tests
+        run: npm test
+
+      - name: Compilar
+        run: npm run build

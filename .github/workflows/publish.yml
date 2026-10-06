@@ -1,0 +1,44 @@
+# Publicación en npm con procedencia (provenance).
+#
+# Se dispara al empujar una etiqueta `vX.Y.Z`. Publica desde CI usando OIDC, de
+# modo que npm sella el origen del paquete de forma verificable. El secreto
+# NPM_TOKEN debe existir en Settings → Secrets → Actions del repositorio, y ser
+# un token con permiso de publicación que salte el 2FA (Automation o granular con
+# bypass de 2FA); si no, npm devuelve 403.
+#
+# `permissions.id-token: write` es imprescindible: sin él, --provenance falla.
+# `--access public` es obligatorio para un paquete con scope (@karlangas12/...).
+name: Publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: publish to npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      # `prepublishOnly` vuelve a pasar typecheck + tests + build antes de
+      # publicar: nada sale a npm sin haber pasado la puerta de calidad.
+      - name: Publicar con procedencia
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
