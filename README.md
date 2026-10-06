@@ -707,13 +707,13 @@ npm test
 Standalone and dependency-free at runtime: `@modelcontextprotocol/sdk` is the
 only peer dependency, and mcp-auth-kit works with any client built on it.
 
-**1.0.2** is the first release published with verifiable
+**1.1.0** is the first release published with verifiable
 [npm provenance](https://docs.npmjs.com/generating-provenance-statements): it
 is built and published from CI via `npm publish --provenance`, so npm records a
 signed, verifiable link back to the exact commit and GitHub Actions run that
-produced the tarball. There is no API change from 1.0.1 — the only difference
-is the publishing pipeline (`.github/workflows/`) and that the supported Node
-floor is now `>=20` (Node 18 is end-of-life).
+produced the tarball. The package API is unchanged from 1.0.1; this is a minor
+rather than a patch because the supported Node floor is now `>=20` (Node 18 is
+end-of-life), which drops support for consumers still on Node 18.
 
 Every fix in the table above came out of a real, open, unresolved issue, and
 each one is pinned by a test that first reproduces the failure against an
